@@ -1,0 +1,290 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 手动打包版本号（如 v1.0.0；打标签推送时忽略）
+        required: false
+        type: string
+      publish_release:
+        description: 手动打包后是否同时发布 GitHub Release（需填版本号）
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      actions: write
+    env:
+      # push 事件下 inputs 上下文不可用，必须走 event.inputs
+      APP_VERSION: ${{ github.event_name == 'push' && github.ref_name || (github.event.inputs.app_version != '' && github.event.inputs.app_version || 'dev') }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 检查历史目录名残留
+        shell: pwsh
+        run: |
+          # 不用 git grep：它「无匹配=退出码 1」的健康语义在 pwsh 下会被
+          # 当成命令失败，两次阻断发版。Select-String 结果只由内容决定。
+          $pat = 'work' + 'buddy|z' + 'code'
+          $exts = @('.dart','.js','.html','.yml','.md','.ps1','.sh','.iss','.toml',
+                    '.json','.go','.cmake','.cpp','.h','.txt','.isl','.rc','.tpl','.xml')
+          $hits = @()
+          foreach ($f in @(git ls-files)) {
+            if ($exts -contains [IO.Path]::GetExtension($f).ToLower()) {
+              $m = Select-String -LiteralPath $f -Pattern $pat -List -ErrorAction SilentlyContinue
+              if ($m) { $hits += $f }
+            }
+          }
+          Write-Host ("目录名残留扫描：命中 $($hits.Count) 个文件")
+          if ($hits.Count -gt 0) {
+            Write-Error "跟踪文件出现历史工作目录残留: $($hits -join ', ')"
+            exit 1
+          }
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.47.4'
+          cache: false
+
+      - name: Setup Go (内核)
+        if: hashFiles('third_party/x-tunnel/go.mod') != ''
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: third_party/x-tunnel/go.mod
+          cache: false
+
+      - run: flutter pub get
+
+      - name: 构建 Flutter Windows（注入版本）
+        shell: pwsh
+        run: |
+          $num = ''
+          if ($env:APP_VERSION -match '^v?(\d+\.\d+\.\d+)(?:[+-].*)?$') { $num = $Matches[1] }
+          $args = @('build', 'windows', '--release',
+                    "--dart-define=ECHOS_REPO=${{ github.repository }}")
+          if ($num -ne '') {
+            $args += "--dart-define=ECHOS_VERSION=$num"
+            $args += "--build-name=$num"
+          }
+          $lic = '${{ secrets.ECHOS_LICENSE_URL }}'
+          if ($lic) {
+            $args += "--dart-define=ECHOS_LICENSE_URL=$lic"
+            Write-Host '授权地址已注入（来自 ECHOS_LICENSE_URL secret）'
+          } else {
+            Write-Warning '未配置 ECHOS_LICENSE_URL secret：本次产物不含激活门'
+          }
+          flutter @args
+
+      - name: 准备内核 x-tunnel.exe
+        shell: pwsh
+        run: |
+          $rel = 'build/windows/x64/runner/Release'
+          if (Test-Path 'third_party/x-tunnel/go.mod') {
+            pushd 'third_party/x-tunnel'
+            go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o x-tunnel.exe .
+            popd
+            Copy-Item 'third_party/x-tunnel/x-tunnel.exe' "$rel/x-tunnel.exe" -Force
+          } elseif (Test-Path 'windows/bundle/x-tunnel.exe') {
+            Copy-Item 'windows/bundle/x-tunnel.exe' "$rel/x-tunnel.exe" -Force
+          } else {
+            Write-Error '未找到内核二进制或源码'
+            exit 1
+          }
+
+      - name: 下载 geo 数据
+        shell: pwsh
+        run: |
+          $rel = 'build/windows/x64/runner/Release'
+          Invoke-WebRequest 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat' -OutFile "$rel/geoip.dat"
+          Invoke-WebRequest 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat' -OutFile "$rel/geosite.dat"
+
+      - name: 下载 wintun.dll（TUN 模式必需）
+        shell: pwsh
+        run: |
+          $rel = 'build/windows/x64/runner/Release'
+          $wintunVersion = '0.14.1'
+          $zip = "$env:TEMP\wintun.zip"
+          $xdir = "$env:TEMP\wintun"
+          Invoke-WebRequest "https://www.wintun.net/builds/wintun-$wintunVersion.zip" -OutFile $zip
+          if (Test-Path $xdir) { Remove-Item -LiteralPath $xdir -Recurse -Force }
+          Expand-Archive -LiteralPath $zip -DestinationPath $xdir -Force
+          $src = Join-Path $xdir 'wintun\bin\amd64\wintun.dll'
+          if (-not (Test-Path $src)) { Write-Error "wintun 包里找不到 $src"; exit 1 }
+          Copy-Item $src "$rel/wintun.dll" -Force
+          Write-Output ("wintun.dll {0:N0} KB" -f ((Get-Item "$rel/wintun.dll").Length / 1KB))
+
+      - name: 构建安装器（Inno Setup）-> EchOS-Win-<版本>-x64-Setup.exe
+        shell: pwsh
+        run: |
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          # EchOS.iss 的 WizardStyle=modern dynamic 要求 Inno 6.4+，镜像自带版本未锁定
+          $probe = Join-Path $env:TEMP 'inno64probe.iss'
+          Set-Content -LiteralPath $probe @('[Setup]', 'AppName=probe', 'AppVersion=1.0.0',
+                                           'DefaultDirName={autopf}\probe', 'WizardStyle=modern dynamic')
+          & $iscc $probe *> $null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output '镜像 Inno < 6.4（不支持 modern dynamic），升级 Inno Setup…'
+            choco upgrade innosetup -y --no-progress
+          }
+          Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+          & $iscc installer/EchOS.iss "/DAPP_VERSION=$env:APP_VERSION"
+
+      - name: 构建便携单文件（7-Zip SFX 自解压）-> Output/EchOS-Win-<版本>-x64-Portable.exe
+        shell: pwsh
+        run: |
+          $7z = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path $7z)) { choco install 7zip -y --no-progress }
+          $ver = $env:APP_VERSION
+          $rel = Join-Path (Get-Location) 'build\windows\x64\runner\Release'
+          Push-Location $rel
+          & $7z a -t7z -y "$env:TEMP\portable.7z" * | Out-Null
+          Pop-Location
+          Invoke-WebRequest 'https://raw.githubusercontent.com/OlegScherbakov/7zSFX/master/files/7zsd_extra_170_3900.7z' -OutFile "$env:TEMP\7zsd.7z"
+          & $7z x "$env:TEMP\7zsd.7z" -o"$env:TEMP\7zsd" -y | Out-Null
+          $sfx = "$env:TEMP\7zsd\7zsd_LZMA2_x64.sfx"
+          $rh = $null
+          try {
+            Invoke-WebRequest 'https://www.angusj.com/resourcehacker/resource_hacker.zip' -OutFile "$env:TEMP\reshacker.zip"
+            & $7z x "$env:TEMP\reshacker.zip" -o"$env:TEMP\reshacker" -y | Out-Null
+            $rh = "$env:TEMP\reshacker\ResourceHacker.exe"
+          } catch {
+            Write-Output 'angusj.com 下载失败，回退到 choco 安装 ResourceHacker'
+          }
+          if (-not ($rh -and (Test-Path $rh))) {
+            choco install resourcehacker -y --no-progress
+            $rh = @('C:\Program Files (x86)\Resource Hacker', 'C:\Program Files\Resource Hacker') |
+              Where-Object { Test-Path $_ } |
+              ForEach-Object { Get-ChildItem $_ -Filter '*.exe' -File -ErrorAction SilentlyContinue } |
+              Where-Object { $_.Name -match 'hacker' } |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if ($rh -and (Test-Path $rh)) {
+            # mask 必须是 ICONGROUP,101：7zSD 系列 SFX 的图标组 id 就是 101
+            & $rh -open $sfx -save $sfx -action addoverwrite -res "installer/logo.ico" -mask "ICONGROUP,101," | Out-Null
+            Write-Output "已替换 SFX 图标 -> $rh"
+
+            # LANGUAGE 必须中性 (0,0)：SFX 原资源在 000004b0 块，注入成英文块时中文系统会回退读到 7-Zip
+            $verDot = $ver.TrimStart('v')
+            $verComma = ($verDot -split '\.') -join ','
+            if (($verDot -split '\.').Count -lt 4) { $verComma = "$verComma,0" }
+            $content = (Get-Content -LiteralPath 'installer/portable-version.rc.tpl' -Raw -Encoding UTF8) `
+              -replace '@VER_DOT@', $verDot `
+              -replace '@VER_COMMA@', $verComma
+            # 无 BOM UTF-8：带 BOM 时 ResourceHacker 编译可能报错
+            [IO.File]::WriteAllText("$env:TEMP\portable-version.rc", $content, (New-Object Text.UTF8Encoding $false))
+            & $rh -open "$env:TEMP\portable-version.rc" -save "$env:TEMP\portable-version.res" -action compile | Out-Null
+            & $rh -open $sfx -save $sfx -action addoverwrite -res "$env:TEMP\portable-version.res" -mask "VERSIONINFO,," | Out-Null
+            Write-Output "已替换 SFX 版本资源 -> $verDot"
+          } else {
+            Write-Warning '未取得 ResourceHacker，便携版沿用 SFX 默认图标与版本信息（不影响功能）'
+          }
+          $out = Join-Path (Get-Location) "Output\EchOS-Win-$ver-x64-Portable.exe"
+          $parts = @($sfx, 'installer/portable-config.txt', "$env:TEMP\portable.7z")
+          $fs = [IO.File]::Create($out)
+          foreach ($p in $parts) {
+            $b = [IO.File]::ReadAllBytes($p)
+            $fs.Write($b, 0, $b.Length)
+          }
+          $fs.Close()
+
+      - name: 打包产物自检（防伪更新）
+        shell: pwsh
+        run: |
+          $rel = 'build/windows/x64/runner/Release'
+          $num = ''
+          if ($env:APP_VERSION -match '^v?(\d+\.\d+\.\d+)$') { $num = $Matches[1] }
+
+          # 正式发版（tag 构建）没有授权地址 = 发出去一个拦不住人的包
+          $lic = '${{ secrets.ECHOS_LICENSE_URL }}'
+          if (-not $lic -and '${{ github.ref_type }}' -eq 'tag') {
+            Write-Error '正式发版（tag 构建）未配置 ECHOS_LICENSE_URL secret——拒绝产出无激活门的发布包。'
+            exit 1
+          }
+          if ($lic) {
+            $so = "$rel/data/app.so"
+            if (-not (Test-Path $so)) { Write-Error "缺少 $so"; exit 1 }
+            $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($so))
+            if (-not $text.Contains($lic)) {
+              Write-Error "授权地址未注入产物（检查 ECHOS_LICENSE_URL secret 与构建参数）"
+              exit 1
+            }
+            Write-Output "授权地址已注入产物，激活门生效"
+          }
+
+          if ($num -ne '') {
+            $so = "$rel/data/app.so"
+            if (-not (Test-Path $so)) { Write-Error "缺少 $so"; exit 1 }
+            $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($so))
+            $hit = ([regex]::Matches($text, [regex]::Escape($num))).Count
+            Write-Output "app.so 中版本串 $num 出现 $hit 次"
+            if ($hit -eq 0) { Write-Error "产物内没有版本串 $num —— 版本未注入"; exit 1 }
+          } else {
+            Write-Output "APP_VERSION='$env:APP_VERSION' 非语义化版本，跳过版本串校验"
+          }
+
+          foreach ($f in @("$rel/echos.exe", "$rel/x-tunnel.exe", "$rel/wintun.dll",
+                           "$rel/geoip.dat", "$rel/geosite.dat")) {
+            if (-not (Test-Path $f)) { Write-Error "缺少 $f"; exit 1 }
+          }
+
+          foreach ($f in @("Output/EchOS-Win-$env:APP_VERSION-x64-Setup.exe",
+                           "Output/EchOS-Win-$env:APP_VERSION-x64-Portable.exe")) {
+            if (-not (Test-Path $f)) { Write-Error "缺少 $f"; exit 1 }
+            $len = (Get-Item $f).Length
+            if ($len -lt 1MB) { Write-Error "$f 仅 $len 字节，明显异常"; exit 1 }
+            Write-Output ("{0}  {1:N1} MB" -f $f, ($len / 1MB))
+          }
+          Write-Output '产物自检通过'
+
+      - name: 发布 GitHub Release（带更新日志 + 两个安装包）
+        # 显式 == 'true'：event.inputs 取到的是字符串，'false' 同样为真值
+        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event.inputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ver = $env:APP_VERSION
+          $notesFile = "docs/releases/$ver.md"
+          $args = @('release', 'create', $ver,
+                    "Output/EchOS-Win-$ver-x64-Setup.exe",
+                    "Output/EchOS-Win-$ver-x64-Portable.exe",
+                    '--title', "EchOS-Win $ver")
+          if (Test-Path $notesFile) {
+            Write-Output "使用更新说明：$notesFile"
+            $args += @('--notes-file', $notesFile)
+          } else {
+            Write-Output "未找到 $notesFile，回退为自动生成的提交列表"
+            $args += '--generate-notes'
+          }
+          gh @args
+
+      - name: 清理历史工作流记录（最多保留 2 条）
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $wfFile = ([IO.Path]::GetFileName('${{ github.workflow_ref }}'.Split('@')[0]))
+          $json = gh run list --workflow $wfFile --limit 50 --json databaseId,status --jq '[.[] | select(.status == "completed") | .databaseId]'
+          $ids = $json | ConvertFrom-Json
+          if ($ids.Count -gt 1) {
+            $drop = $ids[1..($ids.Count - 1)]
+          } else {
+            $drop = @()
+          }
+          foreach ($id in $drop) {
+            Write-Output "deleting finished run $id"
+            gh api -X DELETE "/repos/$env:GITHUB_REPOSITORY/actions/runs/$id" | Out-Null
+          }
+          Write-Output "done: 保留本次运行 + 最新完成 ($($ids.Count - $drop.Count)) 条"

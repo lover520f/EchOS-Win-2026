@@ -1,0 +1,103 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# 构建/内核产物（上 GitHub 不提交）
+/windows/bundle/*.exe
+/windows/bundle/*.official
+# 分流数据：打包时按命令下载，不入库（应用首次启动也会自动拉取到 %APPDATA%）
+/windows/bundle/*.dat
+# TUN 模式依赖的 Wintun 驱动 DLL：同样打包时下载，不入库
+# （内核按「与 x-tunnel.exe 同目录」加载它，所以必须落到 windows/bundle）
+/windows/bundle/*.dll
+# 内核编译产物：CI 由 setup-go 从源码构建，本地 go build 产生的 exe 不入库
+/third_party/x-tunnel/x-tunnel.exe
+*.zip
+*.7z
+EchOS-Win-*-Portable.exe
+# 隐私/本地数据（绝不提交）
+**/config.json
+**/*.log
+**/*.db
+# 应用「本地备份」导出的配置（EchOS-备份-<时间戳>.json）。
+# 含全部服务器节点（地址/端口/UUID/token）、路由规则与 WebDAV 地址账号，
+# 敏感程度与 config.json 等同。上面那条 **/config.json 匹配不到这个名字，
+# 一旦导出到项目目录或事后拖进来，就会被 git add . 提交上去。
+EchOS-备份-*.json
+.idea/
+*.iml
+.flutter-plugins-dependencies
+Output/
+
+# Flutter CLI 本地状态（各机器/CI 动态生成，不入库）
+.flutter
+.flutter_tool_state
+/tmp/
+*.sfx
+
+# 打包中间产物
+portable.7z
+iconed.sfx
+_portable_build.tmp
+
+# AI 工作区状态
+.echos-ai/
+
+# 本地构建中间产物目录（build_local.ps1 的 Temp\echos-build：SFX/ResourceHacker/
+# wintun 下载缓存）。与 /build/ 同一惯例：跟着仓库走，但绝不入库。
+Temp/
+
+# 授权服务端代码整体不入库（与下面文档段同一口径）：构建/部署只发生在
+# 本地与 Cloudflare，GitHub 上只保留客户端。其测试临时产物随之不进库。
+license-server/
+
+# wrangler 本地运行/部署缓存
+worker/.wrangler/
+
+# ===== 本地文档归档：不进 GitHub（用户拍板 2026-10-08） =====
+# 授权机制文档、内部分析报告、v1.1.x 及更早的发版说明都收在 docs/archive/，
+# 只在本地维护。docs/releases/ 的发版说明从 v1.2.0 起入库
+#（CI 发布 Release 时读 docs/releases/<tag>.md 作为正文）。
+docs/archive/
