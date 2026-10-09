@@ -97,9 +97,10 @@ class _ActivationPageState extends State<ActivationPage> {
   /// 的断网失败就留空（那句重复的话由状态行承担）。
   static const String _netFailLine = '授权服务器连接失败，请检查网络。';
 
-  /// 弹窗里「点我去 TG 群」要跳的链接，激活页打开时向服务端取一次。
-  /// 取不到就是空串，界面上不显示这个按钮——用户仍可以照下面写的
-  /// 机器人命令去私聊机器人，那条路不依赖这个链接。
+  /// 弹窗里「点我去 TG 群」要跳的链接。本地缓存先顶上（进页面即可见，
+  /// 不再等一趟网络），再向服务端取最新的覆盖。断网取不到时按钮照常
+  /// 显示——入口不因网络消失，没网的时候恰恰最需要它；缓存也没有
+  /// （全新机器且从没联网取到过）才是真的空。
   String _inviteLink = '';
 
   /// 每次「粘贴」自增，用作激活码输入框的 key。
@@ -116,6 +117,7 @@ class _ActivationPageState extends State<ActivationPage> {
     _authHeadline = _headline(_svc.stage);
     _authTone = _toneOf(_svc.stage);
     _code = _svc.savedCode;
+    _inviteLink = _svc.cachedInviteLink;
     _loadInviteLink();
     // 激活页是**接管性**页面：它出现的那一刻（被吊销/封禁），主界面上一切
     // 未决操作都已无意义。但首页换页只换 home 本身，弹在 home 之上的路由
@@ -141,6 +143,9 @@ class _ActivationPageState extends State<ActivationPage> {
         _authHeadline = _headline(_svc.stage);
         _authTone = _toneOf(_svc.stage);
       }
+      // 页面打开时断网、邀请链接还是空的：网络恢复的事件到来时补取
+      // 一次，按钮随缓存到位。
+      if (!_svc.netDown && _inviteLink.isEmpty) _loadInviteLink();
       setState(() {});
     });
   }

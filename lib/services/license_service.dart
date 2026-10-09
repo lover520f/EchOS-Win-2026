@@ -188,6 +188,10 @@ class LicenseService {
     _message = '正在校验授权…';
     _authLog('=== 启动：开始本次授权校验（设备 $deviceCode，客户端版本 $kAppVersionTag）===');
     await verify(source: '启动校验');
+    // 联网启动顺手刷新一次 TG 群邀请链接缓存（与授权校验同一条通道）。
+    // 需要它的激活页恰恰常在断网场景打开，等到那时再取就晚了；趁联网
+    // 先备好，断网的激活页直接用缓存显示按钮。一个 GET，几百字节。
+    if (!netDown) unawaited(fetchInviteLink());
     _timer?.cancel();
     // 启动后 90 秒补查（事件驱动改造后仅 WS 掉线时才有意义：KV 最终
     // 一致 ~60 秒，推送在线时 resync 会自己来，掉线时这枪补窗口）。
@@ -883,11 +887,39 @@ class LicenseService {
           jsonDecode(await res.transform(utf8.decoder).join());
       if (decoded is! Map) return '';
       final link = decoded['inviteLink'];
-      return link is String ? link.trim() : '';
+      final v = link is String ? link.trim() : '';
+      // 取到就落一份本地缓存：断网时激活页靠它保住「点我去 TG 群」
+      // 按钮——入口不因网络消失，没网的时候恰恰最需要照着去求助。
+      if (v.isNotEmpty) _saveInviteCache(v);
+      return v;
     } catch (_) {
       return '';
     } finally {
       c.close(force: true);
+    }
+  }
+
+  /// 邀请链接的本地缓存文件：与 license.json 同目录（%APPDATA%\EchOS），
+  /// 纯文本一行。写失败不影响任何流程（下次取到再写）。
+  File get _inviteCacheFile =>
+      File('${AppPaths.appDataDir.path}${Platform.pathSeparator}invite-link.txt');
+
+  void _saveInviteCache(String link) {
+    try {
+      _inviteCacheFile.writeAsStringSync(link, flush: true);
+    } catch (_) {}
+  }
+
+  /// 最近一次联网取到的 TG 群邀请链接（本地缓存）。服务端取不到时
+  /// 激活页用它兜底显示按钮；从未联网取到过（全新机器且一直没网）
+  /// 才是空——那种情况没有可跳的地址，隐藏按钮是诚实的做法。
+  String get cachedInviteLink {
+    try {
+      return _inviteCacheFile.existsSync()
+          ? _inviteCacheFile.readAsStringSync().trim()
+          : '';
+    } catch (_) {
+      return '';
     }
   }
 
