@@ -1429,9 +1429,12 @@ class _LicenseChipState extends State<_LicenseChip> {
     final st = svc.stage;
     // 只有真的校验通过才算「有效」。enforcementOff 不算：那一刻服务端
     // 是对谁都放行，把它显示成「授权有效」会让所有人误以为自己有授权。
-    final ok = st == LicenseStage.active;
-    // 校验已停用与未配置同档灰色：它不是故障，红留给真正被拦的状态
-    //（未登记/吊销/封禁/连不上）。
+    // unreachable（会话中断网）按上一份有效结论展示：拦新不杀旧的口径下
+    // 隧道照跑、会话照旧，这枚「凭证位」也维持有效（用户口径：这里只报
+    // 有效/成功，不翻红）——故障真相走授权日志，硬拦态则整页在激活页，
+    // 轮不到这枚角标说话。
+    final ok = st == LicenseStage.active || st == LicenseStage.unreachable;
+    // 校验已停用与未配置同档灰色：它不是故障，红留给真正被拦的状态。
     final color = ok ||
             st == LicenseStage.notConfigured ||
             st == LicenseStage.enforcementOff
@@ -1474,7 +1477,10 @@ class _LicenseChipState extends State<_LicenseChip> {
         // 但这台机器未必激活过，别让人以为这份授权是自己的。
         return '校验已停用';
       case LicenseStage.unreachable:
-        return '授权服务器不可达';
+        // 会话中断网：按上一份有效结论展示（见 build 里 ok 的注释）。
+        // 能出现在主界面的 unreachable 必然是「曾经可用」的会话，
+        // 启动即断网的机器此刻整页在激活页，轮不到这里。
+        return '授权有效';
       case LicenseStage.revoked:
         return '授权已吊销';
       case LicenseStage.banned:
