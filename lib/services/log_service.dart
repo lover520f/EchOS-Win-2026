@@ -220,9 +220,11 @@ class LogService {
     logLines.clear();
     errorLines.clear();
     checkLines.clear();
-    // authLines 与 auth.log 刻意不清：授权留痕是「这台机器此刻凭什么能用」
-    // 的唯一凭据历史，用户报障时第一句话就是「看下授权日志」，它没有级别
-    // 过滤、不随会话轮转，也不该被「清空日志」一键抹掉——误清不可恢复。
+    // 授权视图与 auth.log 一并清空（用户拍板 2026-10-10）：真正的激活凭据
+    // 在 license.json（本方法永不触碰），日志只是诊断历史——「清空」是
+    // 用户的明确动作，没有理由单挡这一类。auth.log 超过 1MB 会自动轮转
+    // 备份到 auth.prev.log，清空时连它一起删，避免旧段回魂。
+    authLines.clear();
     // 等挂起的写队列排空后再删文件，避免清空后旧任务又写回
     _fileQueue = _fileQueue.then((_) async {
       try {
@@ -231,12 +233,15 @@ class LogService {
           previousFile,
           checkFile,
           errorFile,
+          authFile,
+          File('${authFile.parent.path}${Platform.pathSeparator}auth.prev.log'),
         ]) {
           if (f.existsSync()) await f.delete();
         }
         _current = File(currentFile.path)..createSync(recursive: true);
         _check = File(checkFile.path)..createSync();
         _error = File(errorFile.path)..createSync();
+        _auth = File(authFile.path)..createSync();
         _written = 0;
       } catch (_) {}
     });

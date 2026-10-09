@@ -509,6 +509,13 @@ class LicenseService {
       }
       _lastManualAt = now;
     }
+    // 断网快速重试链已在 5 秒一发地轮询时，回前台/窗口显示这类高频聚焦
+    // 事件不再各补一枪——链本身就是最快的节奏，补枪只贡献日志噪音；
+    // 链耗尽（约 1 分钟）后的聚焦照常触发，恢复真相不缺入口。
+    if ((source == '回前台' || source == '窗口显示') &&
+        _quickRetry?.isActive == true) {
+      return Future.value(LicenseResult(true, _stage, _message));
+    }
     // 服务端给的 TTL（revalidateAfter，秒）：在此之前自动校验自我抑制。
     // 服务端已经给过权威结论，没事件就不该再去问。TTL 只拦"自动来源"
     // （定时器、补课、回前台）——用户按按钮/启动预检/resync 推送都传
@@ -523,9 +530,13 @@ class LicenseService {
     // 记录「真发出去了」的时刻，慢速兜底据此算间隔；TTL 抑制与在途合并
     // 都不算，否则一次被抑制的调用会把兜底时钟往前推，白白延后真正的保底。
     _lastVerifyAt = DateTime.now();
-    if (source.isNotEmpty) _authLog('校验触发来源：$source');
-    return _verifyInFlight =
-        _chain(_verifyWithRetry).whenComplete(() => _verifyInFlight = null);
+    // 机械重试不记「触发来源」行：快速重试链 5 秒一发，4 行/发把断网的一
+    // 分钟刷成 48+ 行；重试的失败有专属单行（见 _verifyOnce）。
+    if (source.isNotEmpty && source != '失败重试') {
+      _authLog('校验触发来源：$source');
+    }
+    return _verifyInFlight = _chain(() => _verifyWithRetry(source))
+        .whenComplete(() => _verifyInFlight = null);
   }
 
   /// 手动校验的节流间隔与上次点击时刻（见 verify 开头的节流说明）。
@@ -548,8 +559,8 @@ class LicenseService {
     return done;
   }
 
-  Future<LicenseResult> _verifyWithRetry() async {
-    final r = await _verifyOnce();
+  Future<LicenseResult> _verifyWithRetry(String source) async {
+    final r = await _verifyOnce(source);
     // 断网→恢复的瞬间补发一次事件（stage 未变也要发）：激活页状态行的
     // 「连接失败」快照靠它对齐回真实档位（吊销/封禁被保留时没有
     // stage 事件可等）。幂等，纯通知。
@@ -621,13 +632,15 @@ class LicenseService {
     return '$path 往返完成（HTTP $statusCode）：$code';
   }
 
-  Future<LicenseResult> _verifyOnce() async {
+  Future<LicenseResult> _verifyOnce(String source) async {
     if (!enabled) {
       return LicenseResult(true, LicenseStage.notConfigured, '');
     }
 
-    _authLog('开始校验授权：设备码 $deviceCode'
-        '${_code.isEmpty ? '，本机未保存激活码' : '，本机已保存激活码'}');
+    if (source != '失败重试') {
+      _authLog('开始校验授权：设备码 $deviceCode'
+          '${_code.isEmpty ? '，本机未保存激活码' : '，本机已保存激活码'}');
+    }
     // 携带本地保存的激活码：服务端比对记录里当前的码，不一致回
     // code_mismatch——管理端「修改激活码」后旧码持有者即被切断。
     // 一并带上客户端版本：管理页那列版本号原先只在激活时写一次、此后永远
@@ -642,6 +655,13 @@ class LicenseService {
     });
     if (res == null) {
       final r = _handleUnreachable();
+      // 快速重试链的失败一行说完：完整的 4 行仪式（来源/开始/失败/结论）
+      // 只属于有语义的触发（启动/手动/回前台），机械重试重复同样的结论
+      // 十几次只会把日志刷成噪音——断网那一分钟从 48+ 行降到 12 行。
+      if (source == '失败重试') {
+        _authLog('快速重试失败：$netFailHeadline');
+        return r;
+      }
       _authLog('校验未完成：连不上授权服务器'
           '${_stage == LicenseStage.unreachable ? '（$message）' : '（维持原结论：${_stageName(_stage)}）'}');
       return r;
