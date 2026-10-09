@@ -320,11 +320,17 @@ class _ActivationPageState extends State<ActivationPage> {
       _busy = false;
       _busyAction = null;
       _authErr = !r.ok;
-      // 校验的结果细节写在按钮上方的消息行：连接失败时给出上次成功校验
-      // 的时间尾巴；通过后清空（状态行由结论快照承担）。
-      if (!r.ok && r.stage == LicenseStage.unreachable) {
-        final tail = r.message.replaceFirst('授权服务器连接失败，请检查网络', '').trim();
-        _verifyMsg = tail.isEmpty ? '' : tail.replaceFirst('（', '').replaceFirst('）', '');
+      // 校验的结果细节写在按钮上方的消息行：连不上时给出上次成功校验的
+      // 时间尾巴；「维持原结论」的断网答复（硬拦档位被保留，见
+      // _handleUnreachable）没有尾巴，就明写「连接失败」。通过后清空
+      // （状态行由结论快照承担）。
+      if (!r.ok) {
+        final tail = r.message
+            .replaceFirst('授权服务器连接失败，请检查网络', '')
+            .trim();
+        _verifyMsg = tail.isEmpty
+            ? '授权服务器连接失败，请检查网络'
+            : tail.replaceFirst('（', '').replaceFirst('）', '');
       } else {
         _verifyMsg = '';
       }

@@ -511,11 +511,13 @@ class LicenseService {
       _unreachableRetries = 0;
       return r;
     }
-    if (r.stage == LicenseStage.unreachable && _unreachableRetries < 12) {
+    // 连不上就快速重试：用 _netDown 而不是 stage 判——硬拦档位被保留时
+    // stage 不再是 unreachable，但网络依然是断的，重试链不能停。
+    if (_netDown && _unreachableRetries < 12) {
       _unreachableRetries++;
       _quickRetry?.cancel();
       _quickRetry = Timer(const Duration(seconds: 5), () {
-        if (_stage == LicenseStage.unreachable) verify(source: '失败重试');
+        if (_netDown) verify(source: '失败重试');
       });
     }
     return r;
@@ -589,9 +591,13 @@ class LicenseService {
     });
     if (res == null) {
       final r = _handleUnreachable();
-      _authLog('校验未完成：连不上授权服务器（$message）');
+      _authLog('校验未完成：连不上授权服务器'
+          '${_stage == LicenseStage.unreachable ? '（$message）' : '（维持原结论：${_stageName(_stage)}）'}');
       return r;
     }
+    // 请求往返成功 = 网络恢复了（哪怕答复是否定）：清掉断网标记，
+    // 快速重试链到此收手，交回常规节奏。
+    _netDown = false;
     _authLog(_httpNote('/verify', _lastStatusCode, res['status']));
 
     switch (res['status']) {
@@ -791,9 +797,31 @@ class LicenseService {
         _ => s.name,
       };
 
-  /// 连不上服务端时一律拦，没有例外分支。
+  /// 连不上授权服务器时一律拦，没有例外分支。
   /// 原来这里有 7 天宽限期，见文件头「为什么连不上也拦」。
   LicenseResult _handleUnreachable() {
+    // 连不上 ≠ 可以进：unreachable 永远不能顶掉一个「服务器明确说不」的
+    // 结论。吊销/封禁/未登记/码已签发的客户端断网后必须停在激活页——
+    // 否则拔根网线就能把拦截界面翻回主页面（2026-10-09 实测踩中：
+    // 吊销后断网，stage 被覆写成 unreachable，主页面回来了）。
+    // 档位保留原样，答复如实报「连不上」；网络恢复后 quickRetry 链
+    // 自动重新校验，拿回最新结论。
+    switch (_stage) {
+      case LicenseStage.revoked:
+      case LicenseStage.banned:
+      case LicenseStage.unregistered:
+      case LicenseStage.codeIssued:
+        _netDown = true;
+        _revalidateAt = null;
+        // 结果的 stage 带原档位（revoked/…）而不是 unreachable：激活页据此
+        // 把「授权服务器连接失败」写进激活提示行（红色），而不是让状态行
+        // 一句「已吊销」把断网原因吞掉。
+        return LicenseResult(
+            false, _stage, '授权服务器连接失败，请检查网络');
+      default:
+        break;
+    }
+    _netDown = true;
     // 连不上时 TTL 必须让位：快速重试链要能立即出发，不能被上次的
     // 服务端指示压住。
     _revalidateAt = null;
@@ -804,6 +832,10 @@ class LicenseService {
     _set(LicenseStage.unreachable, '授权服务器连接失败，请检查网络$tail');
     return LicenseResult(false, LicenseStage.unreachable, _message);
   }
+
+  /// 最近一次授权请求是否因网络失败（与 stage 解耦：硬拦档位被保留时
+  /// stage 不再是 unreachable，快速重试链靠这个标记继续走）。
+  bool _netDown = false;
 
   /// 大致多久之前。只用于给人看，不参与任何判定。
   String _ago(DateTime t) {
