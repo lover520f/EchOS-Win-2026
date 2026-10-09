@@ -13,7 +13,7 @@
 // 没带的话 LicenseService 走 notConfigured 分支（不拦截），本页只能从主界面
 // 状态栏右侧的「授权」那一小条主动点进来——那意味着发出去的是一份拦不住人的包。
 import 'dart:async';
-import 'dart:io' show Socket, SocketException;
+import 'dart:io' show Socket;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -40,8 +40,22 @@ class _ActivationPageState extends State<ActivationPage> {
   final _svc = LicenseService.instance;
   String _code = '';
   String _tip = '';
-  bool _err = false;
   bool _busy = false;
+
+  /// 哪个动作在进行：'activate' / 'auth'（重新校验）/ 'net'（检查网络）。
+  /// _busy 是三者的总闸（互斥、进行中全部按钮禁用），但状态行的进行时
+  /// 文案只属于 auth/net——「激活」的进行时显示在激活提示行（_tip）。
+  /// 若共享一个进行时文案，点「激活」时状态行会跟着转「正在校验授权…」，
+  /// 两个按钮看起来就联动了（用户口径：每个按钮对应自己的消息）。
+  String? _busyAction;
+
+  /// 激活提示行（_tip）的红字位：只由激活 / 粘贴 / 剪贴板 / TG 跳转的
+  /// 失败置位，「重新校验」的结果不碰它。
+  bool _actErr = false;
+
+  /// 授权状态行的红字位：只由「重新校验」的结果置位，激活的成败不碰它。
+  bool _authErr = false;
+
   StreamSubscription<LicenseStage>? _sub;
 
   /// 复制按钮的「已复制」态：点一下变绿色，2 秒后回到「复制」。
@@ -128,7 +142,7 @@ class _ActivationPageState extends State<ActivationPage> {
     final err = openExternalUrl(_inviteLink);
     if (err == null) return;
     setState(() {
-      _err = true;
+      _actErr = true;
       _tip = err;
     });
   }
@@ -146,7 +160,7 @@ class _ActivationPageState extends State<ActivationPage> {
       // 剪贴板被别的进程占住时读不出来，这是 Windows 上真实会发生的。
       if (!mounted) return;
       setState(() {
-        _err = true;
+        _actErr = true;
         _tip = '读不到剪贴板，请手动输入或用 Ctrl+V';
       });
       return;
@@ -155,7 +169,7 @@ class _ActivationPageState extends State<ActivationPage> {
     if (!mounted) return;
     if (text.isEmpty) {
       setState(() {
-        _err = true;
+        _actErr = true;
         _tip = '剪贴板里没有内容';
       });
       return;
@@ -163,7 +177,7 @@ class _ActivationPageState extends State<ActivationPage> {
     setState(() {
       _code = text;
       _pasteSeq++;
-      _err = false;
+      _actErr = false;
       // 粘贴换了码，上一次的激活结果随之作废（与手动输入同一条规矩），
       // 不然按钮和输入框还停在「已激活/激活失败」的旧结果色上。
       _activateResult = null;
@@ -182,18 +196,20 @@ class _ActivationPageState extends State<ActivationPage> {
     if (_busy) return;
     setState(() {
       _busy = true;
+      _busyAction = 'activate';
       _tip = '正在校验…';
-      _err = false;
+      _actErr = false;
       _activateResult = null;
     });
     final r = await _svc.activate(_code);
     if (!mounted) return;
     setState(() {
       _busy = false;
+      _busyAction = null;
       // 激活失败也可能是因为连不上服务器：这时提示行留空，
       // 那句重复的话由副标题（状态行）承担。
       _tip = r.stage == LicenseStage.unreachable ? '' : r.message;
-      _err = !r.ok;
+      _actErr = !r.ok;
       // 失败不改按钮：失败原因在提示行报告（红色），按钮保持「激活」
       // 让用户随时可重试——按钮一旦变成别的名字，提示行里"点「激活」"
       // 指的那颗按钮就不在页面上了。
@@ -211,7 +227,8 @@ class _ActivationPageState extends State<ActivationPage> {
 
   /// 进行时的状态行文案：跟触发按钮的语义对齐——
   /// 「重新校验」显示「正在校验授权…」，「检查网络」显示「正在检查网络…」。
-  String _busyLabel = '正在校验授权…';
+  String get _busyLabel =>
+      _busyAction == 'net' ? '正在检查网络…' : '正在校验授权…';
 
   /// 「检查网络」：纯网络探测——TCP 直连授权服务器的 443，结果单行
   /// 富文本（彩色符号 + 文案 + 灰字详情）。**不触发授权校验**（用户
@@ -219,9 +236,17 @@ class _ActivationPageState extends State<ActivationPage> {
   /// 授权结论混进网络结果。服务器域名/地址不落界面（页面头成文原则）。
   Future<void> _checkNetwork() async {
     if (_busy) return;
+    // 客户端冷却：纯本机 TCP 探测对服务端零负担，连点没有意义，
+    // 2 秒内的重复点击直接忽略（按钮不进「正在检查」假态）。
+    final now = DateTime.now();
+    if (_lastNetAt != null &&
+        now.difference(_lastNetAt!) < const Duration(seconds: 2)) {
+      return;
+    }
+    _lastNetAt = now;
     setState(() {
       _busy = true;
-      _busyLabel = '正在检查网络…';
+      _busyAction = 'net';
       _verifyMsg = '';
       _verifySpan = null;
       _actionLine = 'net';
@@ -250,6 +275,7 @@ class _ActivationPageState extends State<ActivationPage> {
     if (!mounted) return;
     setState(() {
       _busy = false;
+      _busyAction = null;
       final detail =
           ok ? '网络延迟 ${sw.elapsedMilliseconds} ms' : _netFailHint(netErr);
       _netLastOk = ok;
@@ -265,30 +291,22 @@ class _ActivationPageState extends State<ActivationPage> {
     });
   }
 
-  /// TCP 探测失败的原因分类。dart:io 的 SocketException 文案是固定英文
-  ///（Windows / macOS 同一套），关键词匹配 + 兜底原句——认不出的措辞
-  /// 退回「网络异常」，不引入新的失败路径。
+  /// TCP 探测失败的原因分类：口径与授权请求日志共用一份
+  /// （LicenseService.describeNetError），认不出的措辞退回
+  /// 「网络异常」，不引入新的失败路径。
   String _netFailHint(Object? e) {
-    if (e is SocketException) {
-      final m = '${e.message} ${e.osError?.message ?? ''}'.toLowerCase();
-      if (m.contains('timed out') || m.contains('timeout')) return '连接超时';
-      if (m.contains('refused')) return '连接被拒绝';
-      if (m.contains('lookup')) return '域名解析失败';
-      if (m.contains('no route') || m.contains('unreachable')) return '网络不可达';
-    }
-    return '网络异常，请检查本机网络';
+    final s = LicenseService.describeNetError(e);
+    return s ?? '网络异常，请检查本机网络';
   }
 
   Future<void> _reverify() async {
     if (_busy) return;
     setState(() {
       _busy = true;
+      _busyAction = 'auth';
       // 校验进行中：由状态行覆盖显示（见卡片二布局），
       // 消息行只留给结果细节。上一次检查网络的结果一并清掉：
       // 独占制——点重新校验，整个状态区就只属于授权校验。
-      // 进行时文案也归位——它可能被上一个「检查网络」改掉
-      // （_busyLabel 是共享字段），不重置会串台成「正在检查网络…」。
-      _busyLabel = '正在校验授权…';
       _verifySpan = null;
       _actionLine = 'auth';
     });
@@ -300,7 +318,8 @@ class _ActivationPageState extends State<ActivationPage> {
     _authTone = _toneOf(_svc.stage);
     setState(() {
       _busy = false;
-      _err = !r.ok;
+      _busyAction = null;
+      _authErr = !r.ok;
       // 校验的结果细节写在按钮上方的消息行：连接失败时给出上次成功校验
       // 的时间尾巴；通过后清空（状态行由结论快照承担）。
       if (!r.ok && r.stage == LicenseStage.unreachable) {
@@ -330,7 +349,10 @@ class _ActivationPageState extends State<ActivationPage> {
   Widget build(BuildContext context) {
     final t = Theme.of(context);
     final stage = _svc.stage;
-    final errored = _err || _stageBad(stage);
+    final errored = _actErr || _authErr || _stageBad(stage);
+    // 状态行的进行时只属于授权/网络动作：点「激活」时这一行保持上一条结论
+    // 不动——「激活」的进行时由激活提示行（_tip）自己承担，两边各说各的。
+    final statusBusy = _busy && _busyAction != 'activate';
 
     return Scaffold(
       body: Container(
@@ -403,7 +425,7 @@ class _ActivationPageState extends State<ActivationPage> {
                               style: EchTheme.smallStyle(
                                   _activateResult == 'ok'
                                       ? EchTheme.blue
-                                      : (_err
+                                      : (_actErr
                                           ? EchTheme.red
                                           : EchTheme.textSoft(t)))),
                         ],
@@ -419,6 +441,7 @@ class _ActivationPageState extends State<ActivationPage> {
                                     fontSize: EchTheme.fsAction,
                                     fontWeight: EchTheme.fwTitle,
                                     enabled: !_busy,
+                                    focusable: false,
                                     onPressed: _openInviteLink),
                               ),
                               const SizedBox(width: 10),
@@ -437,6 +460,7 @@ class _ActivationPageState extends State<ActivationPage> {
                                   // 空码也放行点击：点了好在提示行里报
                                   //「请输入激活码」，比灰按钮少一次困惑。
                                   enabled: !_busy,
+                                  focusable: false,
                                   onPressed: _activate),
                             ),
                           ],
@@ -450,6 +474,7 @@ class _ActivationPageState extends State<ActivationPage> {
                             fontSize: EchTheme.fsAction,
                             fontWeight: EchTheme.fwTitle,
                             enabled: !_busy,
+                            focusable: false,
                             onPressed: _openInviteLink),
                         if (_tip.isNotEmpty) ...[
                           const SizedBox(height: 12),
@@ -459,7 +484,7 @@ class _ActivationPageState extends State<ActivationPage> {
                               style: EchTheme.smallStyle(
                                   _activateResult == 'ok'
                                       ? EchTheme.blue
-                                      : (_err
+                                      : (_actErr
                                           ? EchTheme.red
                                           : EchTheme.textSoft(t)))),
                         ],
@@ -481,7 +506,7 @@ class _ActivationPageState extends State<ActivationPage> {
                         // 进行时（_busy 且结果未出）：显示「正在检查网络…」——
                         // 之前这里渲染的是「…」占位符，用户看到的是先一个
                         // 省略号再跳结果，进行时文案根本没出场。
-                        if (_busy && _verifySpan == null) ...[
+                        if (statusBusy && _verifySpan == null) ...[
                           Text(_busyLabel,
                               style: EchTheme.bodyStyle(EchTheme.textSoft(t))),
                         ] else ...[
@@ -514,8 +539,8 @@ class _ActivationPageState extends State<ActivationPage> {
                         ],
                       ] else ...[
                         Text(
-                            _busy ? _busyLabel : (_authHeadline.isEmpty ? ' ' : _authHeadline),
-                            style: _busy
+                            statusBusy ? _busyLabel : (_authHeadline.isEmpty ? ' ' : _authHeadline),
+                            style: statusBusy
                                 ? EchTheme.bodyStyle(EchTheme.textSoft(t))
                                 : EchTheme.bodyStyle(_authTone == 'red'
                                     ? EchTheme.red
@@ -549,12 +574,14 @@ class _ActivationPageState extends State<ActivationPage> {
                                     fontSize: EchTheme.fsAction,
                                     fontWeight: EchTheme.fwTitle,
                                     enabled: !_busy,
+                                    focusable: false,
                                     onPressed: _checkNetwork)
                                 : AppButton('检查网络',
                                     height: 40,
                                     fontSize: EchTheme.fsAction,
                                     fontWeight: EchTheme.fwTitle,
                                     enabled: !_busy,
+                                    focusable: false,
                                     onPressed: _checkNetwork),
                           ),
                           const SizedBox(width: 10),
@@ -564,6 +591,7 @@ class _ActivationPageState extends State<ActivationPage> {
                                 fontSize: EchTheme.fsAction,
                                 fontWeight: EchTheme.fwTitle,
                                 enabled: !_busy,
+                                focusable: false,
                                 onPressed: _reverify),
                           ),
                         ],
@@ -609,7 +637,10 @@ class _ActivationPageState extends State<ActivationPage> {
                 const SizedBox(width: 10),
                 AppButton(actionLabel,
                     gradient: actionGradient,
-                    enabled: !busy, onPressed: onAction, minWidth: 62),
+                    enabled: !busy,
+                    focusable: false,
+                    onPressed: onAction,
+                    minWidth: 62),
               ],
             ],
           ),
@@ -782,6 +813,9 @@ class _ActivationPageState extends State<ActivationPage> {
   /// 「检查网络」最近一次的结果：null = 还没查过。红色胶囊的条件：
   /// 没查过且当前授权不可达，或最近一次检查失败。
   bool? _netLastOk;
+
+  /// 「检查网络」最近一次点击时刻（2 秒冷却用，见 _checkNetwork）。
+  DateTime? _lastNetAt;
 
   /// 状态行文案 + 分类色的口径：服务端明确说不（未登记/吊销/封禁/
   /// 连不上）与待用户操作（码已签发）都算需要被看见的结论，红字；

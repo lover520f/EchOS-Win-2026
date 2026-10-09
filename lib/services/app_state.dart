@@ -760,14 +760,52 @@ class AppState extends ChangeNotifier {
     proxyReady = r.ok;
     if (r.ok) {
       _log('浏览器等程序已自动走本工具');
+      _startSysProxyWatch();
     }
     _refreshProxySummary();
     notifyListeners();
   }
 
+  // 运行期系统代理巡逻：v2rayN / Clash 等工具开着时可能把系统代理抢写成
+  // 自己的地址（哪怕它界面上没开「系统代理」），表现为「EchOS 开着却上不了
+  // 网」。20 秒一查，被抢占就明白告诉用户是谁的地址、怎么办——不自动抢回
+  // （会跟对方乒乓互写，越抢越乱）。恢复指回本工具后警告自动解除。
+  Timer? _sysProxyWatch;
+  bool _sysProxyStolenNotified = false;
+  void _startSysProxyWatch() {
+    _sysProxyWatch?.cancel();
+    _sysProxyStolenNotified = false;
+    _sysProxyWatch = Timer.periodic(const Duration(seconds: 20), (_) async {
+      final thief = await SystemProxy.stolenBy();
+      if (thief == null) {
+        if (_sysProxyStolenNotified) {
+          _sysProxyStolenNotified = false;
+          _log('[系统代理] 系统代理已重新指回本工具');
+          _refreshStatusText();
+          notifyListeners();
+        }
+        return;
+      }
+      if (_sysProxyStolenNotified) return;
+      _sysProxyStolenNotified = true;
+      _log('[系统代理] ⚠ 检测到系统代理已被其他程序改为 $thief（本工具的代理'
+          '仍在运行）——浏览器流量正被引向那个地址。常见于同时开着 v2rayN/'
+          'Clash 等工具：请关闭对应工具，或停止后重新启动本工具代理');
+      _refreshStatusText();
+      notifyListeners();
+    });
+  }
+
+  void _stopSysProxyWatch() {
+    _sysProxyWatch?.cancel();
+    _sysProxyWatch = null;
+    _sysProxyStolenNotified = false;
+  }
+
   Future<void> disableSystemProxy() async {
     proxyTakenOver = false;
     proxyReady = false;
+    _stopSysProxyWatch();
     final warns = await SystemProxy.restore();
     for (final w in warns) {
       _log('[系统代理] $w');

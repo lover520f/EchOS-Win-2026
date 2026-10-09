@@ -123,6 +123,14 @@ class LicenseService {
   /// 两条路都不该在校验结果出来之前出现。
   bool _bootstrapped = false;
   bool get bootstrapped => _bootstrapped;
+
+  /// 本次运行是否**曾经**拿到过「可用」结论（active / 放行 / 未配置）。
+  /// 启动首验 unreachable 时界面据此留在激活页（授权弹窗）等恢复，而不是
+  /// 落进主界面挂着红字角标——「拦新」在启动这一关也该拦界面；而一旦
+  /// 进过主界面，之后的 unreachable 只是会话中的抖动，不再把人踢去激活页
+  /// （拦新不杀旧的既有口径，见 hardBlocked 的注释）。
+  bool _everUsable = false;
+  bool get everUsable => _everUsable;
   DateTime? get lastVerifiedAt => _lastVerifiedAt;
   String get deviceCode => DeviceIdentity.current;
 
@@ -266,6 +274,10 @@ class LicenseService {
       _wsConnecting = false;
       _wsBackoff = 0;
       _wsRetry?.cancel();
+      // 推送通道的连接/断开/收包全部留痕：客户端日志是「吊销没及时生效」
+      // 这类问题唯一的现场（服务端只有广播失败的一行 console），没有这几行，
+      // 事后分不清「服务端没推」「通道断了」还是「消息在线路上丢了」。
+      _authLog('推送通道已连接（管理端吊销/恢复可秒级送达）');
       // pong 窗口从「连上」这一刻起算：_lastPongAt 若还停在上一条连接的
       // 旧值（重连场景）或构造时的初始值（首次连接），第一条心跳的 10 秒
       // 探活会把一条刚建好、健康的连接误判成半开而断掉——每条连接固定
@@ -286,6 +298,7 @@ class LicenseService {
         // resync = 服务端主动说「状态变了」——TTL 是"没事件时的节奏"，
         // 这就是事件，force 击穿立即问。
         if (data == 'resync') {
+          _authLog('收到服务端 resync 推送：状态有变，立即校验');
           // 打标记放在这里而不是校验分支里判断：verify 有在途去重，
           // resync 恰好撞上一个在途请求时会直接复用那个 Future，
           // 若标记挂在分支里，这一次询问就没有「刚被 resync 催过」的上下文，
@@ -296,10 +309,12 @@ class LicenseService {
       }, onDone: () {
         _ws = null;
         _stopPing();
+        _authLog('推送通道断开（对端关闭），自动重连中');
         _schedulePushReconnect();
-      }, onError: (_) {
+      }, onError: (e) {
         _ws = null;
         _stopPing();
+        _authLog('推送通道出错（${describeNetError(e) ?? e.runtimeType}），自动重连中');
         _schedulePushReconnect();
       });
     }).catchError((_) {
@@ -438,6 +453,19 @@ class LicenseService {
       return Future.value(
           const LicenseResult(true, LicenseStage.notConfigured, ''));
     }
+    // 手动「重新校验」的客户端节流：3 秒内的连点只放第一枪。
+    // 服务端对 /verify 本就有按 IP 的滑窗限流（撞线回 429），这里不是
+    // 防滥用，是替用户自己拦手——按钮连点除了把自己点进 429、再触发
+    // 一串限流补射之外没有任何产出。节流到点后静默返回当前结论
+    // （不伪造新结果、不动状态），人手正常节奏完全感知不到。
+    if (source == '用户手动') {
+      final last = _lastManualAt;
+      final now = DateTime.now();
+      if (last != null && now.difference(last) < _manualThrottle) {
+        return Future.value(LicenseResult(true, _stage, _message));
+      }
+      _lastManualAt = now;
+    }
     // 服务端给的 TTL（revalidateAfter，秒）：在此之前自动校验自我抑制。
     // 服务端已经给过权威结论，没事件就不该再去问。TTL 只拦"自动来源"
     // （定时器、补课、回前台）——用户按按钮/启动预检/resync 推送都传
@@ -456,6 +484,10 @@ class LicenseService {
     return _verifyInFlight =
         _chain(_verifyWithRetry).whenComplete(() => _verifyInFlight = null);
   }
+
+  /// 手动校验的节流间隔与上次点击时刻（见 verify 开头的节流说明）。
+  static const Duration _manualThrottle = Duration(seconds: 3);
+  DateTime? _lastManualAt;
 
   /// 在途校验，供上面的共享逻辑用。
   Future<LicenseResult>? _verifyInFlight;
@@ -932,12 +964,51 @@ class LicenseService {
       return decoded is Map<String, dynamic> ? decoded : null;
     } catch (e) {
       _lastStatusCode = 0;
-      _authLog('$path 请求失败：$e'
-          '（多为断网、DNS 解析不了或服务端未响应）');
+      // 分类后人话 + 罕见异常带一行原始摘要：直接打印 $e 会把
+      // CERTIFICATE_VERIFY_FAILED: self signed certificate(boringssl 路径…)
+      // 这类多行英文源码位置整段砸进授权日志，既难读也没有分类。
+      final cls = describeNetError(e);
+      if (cls != null) {
+        _authLog('$path 请求失败：$cls');
+      } else {
+        final raw = e.toString().replaceAll('\n', ' ');
+        _authLog('$path 请求失败：未分类网络错误'
+            '（${raw.length > 120 ? '${raw.substring(0, 120)}…' : raw}）');
+      }
       return null;
     } finally {
       c.close(force: true);
     }
+  }
+
+  /// 网络层异常 → 人话分类（授权请求日志与激活页「检查网络」共用一份口径）。
+  /// 返回 null 表示认不出来（调用方自行决定要不要带原始异常摘要）。
+  static String? describeNetError(Object? e) {
+    if (e is SocketException) {
+      final m = '${e.message} ${e.osError?.message ?? ''}'.toLowerCase();
+      if (m.contains('timed out') || m.contains('timeout')) return '连接超时';
+      if (m.contains('refused')) return '连接被拒绝';
+      if (m.contains('lookup') || m.contains('nodename nor servname')) return '域名解析失败';
+      if (m.contains('no route') || m.contains('unreachable') ||
+          m.contains('network is down')) {
+        return '网络不可达';
+      }
+      if (m.contains('reset')) return '连接被重置';
+      if (m.contains('aborted')) return '连接被中断';
+      return '系统网络栈错误（errno ${e.osError?.errorCode ?? '?'}）';
+    }
+    // HandshakeException 是 TlsException 的子类：自签证书报文就在这档。
+    if (e is TlsException) {
+      final m = '${e.message} ${e.osError ?? ''}'.toLowerCase();
+      if (m.contains('certificate_verify_failed') || m.contains('self signed') ||
+          m.contains('certificate')) {
+        return 'TLS 证书校验失败（常见于断网时的劫持应答或本机过滤软件）';
+      }
+      return 'TLS 握手失败';
+    }
+    if (e is TimeoutException) return '等待响应超时';
+    if (e is HttpException) return 'HTTP 传输中断';
+    return null;
   }
 
   // -------------------------------------------------------------------------
@@ -991,6 +1062,11 @@ class LicenseService {
     final changed = old != s;
     _stage = s;
     _message = msg;
+    if (s == LicenseStage.active ||
+        s == LicenseStage.enforcementOff ||
+        s == LicenseStage.notConfigured) {
+      _everUsable = true;
+    }
     if (changed) _onStageChanged(old, s);
     if (changed && !_changes.isClosed) _changes.add(s);
   }

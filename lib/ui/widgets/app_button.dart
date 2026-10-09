@@ -14,6 +14,10 @@ class AppButton extends StatelessWidget {
   final double fontSize;
   final double height;
   final FontWeight fontWeight;
+  /// 是否允许按钮持有键盘焦点。激活页这类弹窗式页面传 false：点击外链
+  /// （如「点我去 TG 群」）会让本窗口失焦→回焦，InkWell 的焦点恢复会连带
+  /// 把滚动视图滚到持焦点的地方，表现为「闪一下划到某按钮」。
+  final bool focusable;
   const AppButton(this.label,
       {super.key,
       this.gradient,
@@ -23,7 +27,8 @@ class AppButton extends StatelessWidget {
       this.minWidth,
       this.fontSize = EchTheme.fsTool,
       this.height = 30,
-      this.fontWeight = EchTheme.fwContent});
+      this.fontWeight = EchTheme.fwContent,
+      this.focusable = true});
 
   @override
   Widget build(BuildContext context) {
@@ -42,6 +47,7 @@ class AppButton extends StatelessWidget {
           borderRadius: BorderRadius.circular(8),
           child: InkWell(
             onTap: enabled ? onPressed : null,
+            canRequestFocus: focusable,
             borderRadius: BorderRadius.circular(8),
             child: Container(
               height: height,

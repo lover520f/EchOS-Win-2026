@@ -47,6 +47,9 @@ class SystemProxy {
       final port = targetPort;
       final e1 = await _regSet(_regKey, 'ProxyEnable', 1);
       final e2 = await _regSetSz(_regKey, 'ProxyServer', '$host:$port');
+      // 记住本工具写入的地址：运行期被抢占检测（stolenBy）靠它判定
+      // 「系统代理还是不是我们的」。
+      _ourServer = '$host:$port';
       await _regSetSz(_regKey, 'ProxyOverride', '<local>');
       // 2-4：接管期间禁用 PAC（AutoConfigURL），避免与手动代理冲突；还原时恢复
       if (_savedAutoConfig != null) await _regDelete(_regKey, 'AutoConfigURL');
@@ -74,14 +77,27 @@ class SystemProxy {
 
   /// 还原系统代理到接管前的状态
   static Future<List<String>> restore() async {
-    await _regSet(_regKey, 'ProxyEnable', _savedProxyEnable ? 1 : 0);
-    if (_savedProxyEnable && _savedProxyServer.isNotEmpty) {
+    final warns = <String>[];
+    // 还原前验活：接管前的代理设置多半来自别的代理工具（v2rayN/Clash 的
+    // 127.0.0.1:10808）。那个工具若已退出，还原回去就是一个指向死端口的
+    // 系统代理——全机直接断网（弹激活页切断、正常停止、异常退出自愈
+    // 都会走到这里）。TCP 探一下：死的就不还原，宁可直连。
+    bool restoreEnabled = _savedProxyEnable;
+    if (restoreEnabled &&
+        _savedProxyServer.isNotEmpty &&
+        !await _proxyAlive(_savedProxyServer)) {
+      restoreEnabled = false;
+      warns.add('原系统代理 $_savedProxyServer 已无响应'
+          '（对应工具可能已退出），已还原为直连而不是指回死端口');
+    }
+    await _regSet(_regKey, 'ProxyEnable', restoreEnabled ? 1 : 0);
+    if (restoreEnabled && _savedProxyServer.isNotEmpty) {
       // 只有「接管前确实开着代理」才写回地址 —— 那是用户真在用的配置。
       await _regSetSz(_regKey, 'ProxyServer', _savedProxyServer);
-    } else if (!_savedProxyEnable) {
-      // 接管前代理本来就是关的：注册表里那个 ProxyServer 多半是别的代理工具
-      // （v2rayN / Clash 等）退出时留下的僵尸值，比如 127.0.0.1:10808。
-      // 代理关着时它不生效，但留着有两个坏处：
+    } else {
+      // 接管前代理本来就是关的（或验活判死）：注册表里那个 ProxyServer
+      // 多半是别的代理工具（v2rayN / Clash 等）退出时留下的僵尸值，
+      // 比如 127.0.0.1:10808。代理关着时它不生效，但留着有两个坏处：
       //   1) 日志和系统设置里看起来像「还原到了一个陌生地址」，平白引起误解；
       //   2) 用户日后手动打开系统代理开关时，会意外连到这个早就不存在的地址。
       // 所以这里删掉，还原成「干净的未启用」状态。
@@ -102,7 +118,25 @@ class SystemProxy {
     await _notifySettingChange();
     isActive = false;
     await clearBackup();
-    return const [];
+    return warns;
+  }
+
+  /// 代理地址（host:port 形式）是否还有进程在监听。
+  /// 解析不出端口的写法（分协议形式等）一律按「活着」处理——
+  /// 验活是尽力而为的防御，不能因为格式认不出就把用户配置改掉。
+  static Future<bool> _proxyAlive(String server) async {
+    final parts = server.split(':');
+    final host = parts.isEmpty || parts.first.isEmpty ? null : parts.first;
+    final port = parts.length > 1 ? int.tryParse(parts.last) : null;
+    if (host == null || port == null) return true;
+    try {
+      final s = await Socket.connect(host, port,
+          timeout: const Duration(milliseconds: 800));
+      s.destroy();
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// 当前系统代理摘要
@@ -111,6 +145,26 @@ class SystemProxy {
         'reg', ['query', _regKey, '/v', 'ProxyEnable'], runInShell: true);
     if ((r.stdout as String).contains('0x1')) return '已接管（系统代理已开启）';
     return '未启用';
+  }
+
+  /// 本工具接管时写入的代理地址（「127.0.0.1:端口」）。
+  static String _ourServer = '';
+
+  /// 运行期被抢占检测：接管期间系统代理若已不再指向本工具，返回抢占者
+  /// 写入的地址（如 v2rayN 的 127.0.0.1:10808）；仍在自己手里返回 null。
+  ///
+  /// v2rayN / Clash 等工具会在自己的生命周期里回写系统代理（哪怕它界面
+  /// 上没开「系统代理」），抢占后浏览器流量被引向那个（常常没在服务的）
+  /// 端口——用户看到的就是「EchOS 开着却上不了网」。只报告、不自动抢回：
+  /// 自动抢回会跟对方工具乒乓互写注册表，越抢越乱；提示用户处理才是解。
+  static Future<String?> stolenBy() async {
+    if (!isActive || _ourServer.isEmpty) return null;
+    final r = await Process.run(
+        'reg', ['query', _regKey, '/v', 'ProxyEnable'], runInShell: true);
+    if (!(r.stdout as String).contains('0x1')) return null;
+    final server = await _regQuerySz(_regKey, 'ProxyServer') ?? '';
+    if (server.isEmpty || server == _ourServer) return null;
+    return server;
   }
 
   // ---- Windows 注册表操作 ----
@@ -196,13 +250,22 @@ class SystemProxy {
     try {
       if (!f.existsSync()) return warns;
       final data = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
-      final wasOn = data['enable'] == true;
+      var wasOn = data['enable'] == true;
       final server = data['server'] as String? ?? '';
       final override = data['override'] as String?;
       final autoconfig = data['autoconfig'] as String?;
+      // 与 restore() 同一套验活：异常退出自愈时，备份里的代理同样可能
+      // 已随其工具退出而变成死端口，照写回就是「开机即断网」。
+      if (wasOn && server.isNotEmpty && !await _proxyAlive(server)) {
+        wasOn = false;
+        warns.add('备份中的系统代理 $server 已无响应（对应工具可能已退出），'
+            '本次自愈还原为直连而不是指回死端口');
+      }
       await _regSet(_regKey, 'ProxyEnable', wasOn ? 1 : 0);
       if (wasOn) {
         await _regSetSz(_regKey, 'ProxyServer', server.isNotEmpty ? server : '127.0.0.1:1080');
+      } else {
+        await _regDelete(_regKey, 'ProxyServer');
       }
       if (override != null) {
         await _regSetSz(_regKey, 'ProxyOverride', override);
