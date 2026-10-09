@@ -334,6 +334,15 @@ class _ActivationPageState extends State<ActivationPage> {
     });
     final r = await _svc.verify(force: true, source: '用户手动'); // 用户按钮：击穿 TTL
     if (!mounted) return;
+    // 节流命中：这一按没有产生任何新信息，状态行维持原样——尤其不能
+    // 按旧档位结论刷新回去，那会和真实失败的「连接失败」来回翻面。
+    if (r.throttled) {
+      setState(() {
+        _busy = false;
+        _busyAction = null;
+      });
+      return;
+    }
     // 授权校验结束：一按一条消息，且只占状态行一行（一行信息的原则）。
     //   断网 → 状态行就是那句「连接失败」；档位被保留（吊销/封禁等在
     //     断网时原样保留，见 _handleUnreachable）也一样——重新校验这一按

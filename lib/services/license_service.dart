@@ -82,7 +82,14 @@ class LicenseResult {
   final bool ok;
   final LicenseStage stage;
   final String message;
-  const LicenseResult(this.ok, this.stage, this.message);
+
+  /// 这一发是「手动校验节流命中」的维持现状答复：没有产生任何新信息
+  ///（没发请求、没到结论），界面**不应**据此刷新消息行——否则断网时
+  /// 连点按钮，状态行会在「连接失败」（真实失败）与旧档位结论（节流
+  /// 答复带 ok:true）之间来回翻面。
+  final bool throttled;
+  const LicenseResult(this.ok, this.stage, this.message,
+      {this.throttled = false});
 }
 
 class LicenseService {
@@ -471,7 +478,8 @@ class LicenseService {
       final last = _lastManualAt;
       final now = DateTime.now();
       if (last != null && now.difference(last) < _manualThrottle) {
-        return Future.value(LicenseResult(true, _stage, _message));
+        return Future.value(
+            LicenseResult(true, _stage, _message, throttled: true));
       }
       _lastManualAt = now;
     }
