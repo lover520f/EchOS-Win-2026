@@ -61,6 +61,11 @@ EchOS-Win-*-Portable.exe
 **/config.json
 **/*.log
 **/*.db
+# 部署密钥文件（deploy 文档指引把 CLOUDFLARE_API_TOKEN 放进 worker\.env，
+# license-server 同理）：token 级机密任何时候不入库。license-server/ 整目录
+# 排除之外再单挡一层，防患于未然。
+**/.env
+**/.env.*
 # 应用「本地备份」导出的配置（EchOS-备份-<时间戳>.json）。
 # 含全部服务器节点（地址/端口/UUID/token）、路由规则与 WebDAV 地址账号，
 # 敏感程度与 config.json 等同。上面那条 **/config.json 匹配不到这个名字，
