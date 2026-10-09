@@ -975,10 +975,14 @@ class LicenseService {
     final sw = Stopwatch()..start();
     Object? err;
     // 与 /verify 同一条链、同一个偏好（_preferProxy）：校验走哪条路能通，
-    // 探测就走哪条路，两个信号永远一致。
-    var ok = await _probeHost(host, viaProxy: _preferProxy, onErr: (e) => err = e);
-    if (!ok && await _systemProxyOn()) {
-      ok = await _probeHost(host, viaProxy: !_preferProxy, onErr: (e) => err = e);
+    // 探测就走哪条路，两个信号永远一致。先查系统代理是否真开着（顺带
+    // 刷新地址缓存）——不查的话可能拿 60 秒缓存里已失效的地址去探。
+    final proxyOn = await _systemProxyOn();
+    var ok = await _probeHost(host,
+        viaProxy: _preferProxy && proxyOn, onErr: (e) => err = e);
+    if (!ok && proxyOn) {
+      ok = await _probeHost(host,
+          viaProxy: !(_preferProxy && proxyOn), onErr: (e) => err = e);
     }
     sw.stop();
     return (
