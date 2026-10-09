@@ -509,11 +509,12 @@ class LicenseService {
       }
       _lastManualAt = now;
     }
-    // 断网快速重试链已在 5 秒一发地轮询时，回前台/窗口显示这类高频聚焦
-    // 事件不再各补一枪——链本身就是最快的节奏，补枪只贡献日志噪音；
-    // 链耗尽（约 1 分钟）后的聚焦照常触发，恢复真相不缺入口。
+    // 快速重试链已在 5 秒一发地轮询、或限流补射正在等服务端的 retryAfter
+    // 时，回前台/窗口显示这类高频聚焦事件不再各补一枪——两条链本身就是
+    // 既定的节奏，补枪只贡献请求量与 429（TUN 提权重启的焦点风暴正是靠它
+    // 撞爆闸门的）；链落定后的聚焦照常触发，恢复真相不缺入口。
     if ((source == '回前台' || source == '窗口显示') &&
-        _quickRetry?.isActive == true) {
+        (_quickRetry?.isActive == true || _rateRetry?.isActive == true)) {
       return Future.value(LicenseResult(true, _stage, _message));
     }
     // 服务端给的 TTL（revalidateAfter，秒）：在此之前自动校验自我抑制。

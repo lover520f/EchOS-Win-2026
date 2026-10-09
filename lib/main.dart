@@ -361,8 +361,15 @@ class _EchOSAppState extends State<EchOSApp> with WidgetsBindingObserver {
       themeMode: _brightness == Brightness.dark
           ? ThemeMode.dark
           : ThemeMode.light,
-      home: !LicenseService.instance.bootstrapped
+      home: !LicenseService.instance.bootstrapped ||
+              LicenseService.instance.stage == LicenseStage.unknown
           ? const _BootPage()
+          // 「unknown = 还没有任何结论」时同样留在启动页：bootstrap 已完
+          // 但结论缺席只会发生在首验被 429 限流的场景（限流维持上一次
+          // 结论，而新进程没有上一次）——TUN 提权重启的焦点风暴正好能
+          // 撞出这个档。此时进授权弹窗等于展示一页没有结论的空壳
+          //（状态行空白、卡片空转），按 retryAfter 的补射几秒到一分钟内
+          // 必到，启动页等它即可。
           // 用 hardBlocked 而不是 blocked：unreachable（连不上服务器）不切
           // 激活页——那一刻隧道多半还在正常服务，整页切成激活窗而代理
           // 照跑，用户看到的就是「弹窗了却不断网」。unreachable 留在主界面
