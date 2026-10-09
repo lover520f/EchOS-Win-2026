@@ -20,10 +20,17 @@
 // ## 为什么连不上也拦
 // 原来有过一段宽限期（离线 7 天内照常放行），已经删掉。它挡不住真正要挡的
 // 那种事：吊销只在管理员动手的那一刻生效，而客户端要等下次联网才看得到，
-// 断着网时那 7 天等于给吊销开了个洞。现在改成断网就进不去。
-// 代价是服务端出故障时全站用户一起进不去 —— 这个代价由服务端的全局强制
-// 开关承担：管理员把 enforce 关掉，所有客户端立刻恢复可用。客户端这边
-// 不留、也不该留任何后门，否则那个开关就只是在给自己开后门。
+// 断着网时那 7 天等于给吊销开了个洞。
+//
+// 现行口径分两档（见 blocked 的注释）：
+//   · 没有本地凭证的断网（从未激活 / 上次结论已是否定——否定结论会清掉
+//     「上次校验成功」时间戳）→ 照拦。吊销后拔网线重启绕不过去：时间戳
+//     在吊销落地那一刻就没了。
+//   · 留有凭证的断网 → 不拦，与会话中途断网同款（拦新不杀旧）。重启不比
+//     会话更危险；反过来拦死它是死锁——直连被劫持的环境里校验恰恰要靠
+//     隧道跑起来才通（2026-10-10 TUN 提权实测）。
+// 服务端故障的逃生门不变：管理员关 enforce，所有客户端立刻恢复可用。
+// 客户端这边不留、也不该留任何后门，否则那个开关就只是在给自己开后门。
 //
 // ## 激活信息存在哪、为什么不会被顺走
 // %APPDATA%\EchOS\license.json，只存设备码、激活码、上次校验成功时间。
@@ -136,11 +143,16 @@ class LicenseService {
 
   /// 界面是否被锁在激活页（主界面进不去）。main.dart 的 home 门控与
   /// 托盘菜单的缩减共用这一个口径：hardBlocked（服务器明确说不），或
-  /// 「本次运行从未可用」的 unreachable（拦新也要拦界面）；会话中途的
-  /// unreachable 不锁——隧道和主界面都留着（拦新不杀旧），托盘的
-  /// 代理开关自有一层校验兜底（见 TrayService._toggleWithVerify）。
+  /// 「既没有本会话的可用记录、也没有本地凭证」的 unreachable——后者
+  /// 是全新机器或上次结论已是否定的机器断网启动，没有可保的会话。
+  /// 留着「上次校验成功」时间戳的断网启动不锁（拦新不杀旧跨重启，
+  /// 见 blocked 的注释）：主界面照常、代理照常恢复，校验在网络回来
+  /// （通常就是隧道跑起来）后几秒内追上结论。
   bool get uiLocked =>
-      hardBlocked || (_stage == LicenseStage.unreachable && !_everUsable);
+      hardBlocked ||
+      (_stage == LicenseStage.unreachable &&
+          !_everUsable &&
+          _lastVerifiedAt == null);
 
   /// 最近一次授权请求是否因网络失败。与 stage 解耦：硬拦档位
   /// （吊销/封禁等）在断网时被保留，此时 stage 不再是 unreachable，
@@ -154,10 +166,21 @@ class LicenseService {
 
   /// 是否要把用户挡在激活窗口后面。托盘菜单、关闭按钮、状态栏全看这一个值，
   /// 各处自己判断一遍的话，迟早有一处漏判，用户就从那儿绕进去了。
+  ///
+  /// unreachable 有一档例外：本地还留着「上次校验成功」的时间戳——每个
+  /// 否定结论（吊销/封禁/未登记/换码）都会把它清掉，所以它存在就意味着
+  /// 这台机器最后一次从服务器拿到的答复是可用，此刻只是网络断了。对它的
+  /// 处置与会话中途断网完全同款（拦新不杀旧）：不拦。重启并不比会话中断
+  /// 网更危险——一个断网用户重启得不到任何会话里没有的东西；而拦死它的
+  /// 代价是死锁（直连被劫持的环境里：校验不通 → 不恢复代理 → 校验永远
+  /// 不通，2026-10-10 TUN 提权实测踩中）。时间戳为空的断网（从未激活 /
+  /// 上次结论已是否定）照拦——「吊销后拔网线重启绕过拦截」从这儿走不通：
+  /// 吊销结论落地的那一刻时间戳就被清了。
   bool get blocked =>
       _stage != LicenseStage.active &&
       _stage != LicenseStage.notConfigured &&
-      _stage != LicenseStage.enforcementOff;
+      _stage != LicenseStage.enforcementOff &&
+      !(_stage == LicenseStage.unreachable && _lastVerifiedAt != null);
 
   /// blocked 里「服务器明确说不」的那一档：未登记、码未领、码被换、被吊销。
   /// 与 unreachable（只是这一刻问不到答案）分开：后者本机多半是有授权的，
@@ -187,6 +210,9 @@ class LicenseService {
   /// 读本地状态 → 联网校验 → 起定时复查。启动时调一次。
   Future<void> bootstrap() async {
     _loadLocal();
+    // 代理优先偏好跨重启（net-pref.txt，见 _savePreferProxyPref）：
+    // 载入要在首验之前——被劫持环境的第一枪就该走能通的路。
+    _preferProxy = _loadPreferProxyPref();
     if (!enabled) {
       _bootstrapped = true;
       _authLog('本构建未配置授权服务器（缺少 ECHOS_LICENSE_URL）：'
@@ -1201,10 +1227,12 @@ class LicenseService {
     if (b != null) {
       if (proxyFirst) {
         _preferProxy = false;
+        _savePreferProxyPref();
         _authLog('$path 系统代理失败，直连成功——恢复直连优先');
       } else {
         _preferProxy = true;
         _preferProxyAt = DateTime.now();
+        _savePreferProxyPref();
         _authLog('$path 直连失败，经系统代理成功——此后代理优先（每 30 分钟重探直连）');
       }
       return b;
@@ -1215,6 +1243,30 @@ class LicenseService {
   /// 代理优先标记与其置位时刻（见 _post 的说明）。
   bool _preferProxy = false;
   DateTime? _preferProxyAt;
+
+  /// 代理偏好的落盘文件（与 license.json 同目录）。内容一行：'proxy' /
+  /// 'direct'。跨重启的理由：直连被持续劫持的环境里，记忆只存内存的话
+  /// 每次冷启动都要先撞一遍假证书才被兜底救回——auth.log 每早一串
+  /// 「TLS 证书校验失败」（2026-10-10 反馈「启动总是 TLS 问题」）。
+  /// 文件读不到/损坏一律按 direct 处理，不构成新失败路径。
+  File get _netPrefFile =>
+      File('${AppPaths.appDataDir.path}${Platform.pathSeparator}net-pref.txt');
+
+  bool _loadPreferProxyPref() {
+    try {
+      return _netPrefFile.existsSync() &&
+          _netPrefFile.readAsStringSync().trim() == 'proxy';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  void _savePreferProxyPref() {
+    try {
+      _netPrefFile
+          .writeAsStringSync(_preferProxy ? 'proxy' : 'direct', flush: true);
+    } catch (_) {}
+  }
 
   // 系统代理查询结果缓存：直连被掐的环境里每次失败校验都会走到这里，
   // reg.exe 查询不能在 UI isolate 上反复同步跑（spawn cmd+reg 常态

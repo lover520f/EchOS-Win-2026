@@ -207,12 +207,24 @@ Future<void> main() async {
   // 崩溃自愈只动本地（还原残留代理、清残留内核），与联网校验并行；
   // 两件都落地后再决定要不要恢复上次的代理。
   await AppState.instance.recoverFromUncleanExit();
-  // 未激活不自动恢复上次的代理——连不上服务器同样不恢复，与 LicenseService
-  // 的 fail-closed 口径一致。拦人的激活页挂在前面，背后却把内核和系统代理
-  // 原样拉起来，拦截就只剩界面效果。start() 里有同一道门禁兜底，这里先挡
-  // 一层是为了不留下「检测到自动恢复」的误导日志。
+  // 未激活不自动恢复上次的代理——没有本地凭证的断网（含从未激活）与
+  // LicenseService 的 fail-closed 口径一致；留有「上次校验成功」时间戳的
+  // 断网不拦（拦新不杀旧跨重启，见 blocked 的注释）——直连被劫持的环境
+  // 里正是这个恢复把校验救活的：隧道一跑，校验经隧道就能到服务器。
   if (!LicenseService.instance.blocked) {
     AppState.instance.restoreProxyIfNeeded();
+  } else if (LicenseService.instance.stage == LicenseStage.unknown) {
+    // 首验被限流等场景尚无结论（429 维持「上一次」，新进程没有上一次）：
+    // 结论一到就补这个恢复决定。没有这一笔，限流窗口会把提权重启承诺的
+    // 「自动恢复代理」永远错过。
+    late final StreamSubscription<LicenseStage> sub;
+    sub = LicenseService.instance.changes.listen((s) {
+      if (s == LicenseStage.unknown) return;
+      sub.cancel();
+      if (!LicenseService.instance.blocked) {
+        AppState.instance.restoreProxyIfNeeded();
+      }
+    });
   }
   // 对齐 Mac：启动 3 秒后静默检查更新（App 版本 + 分流数据）。
   // 被拦下的客户端连更新源都不该再碰。
