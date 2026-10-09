@@ -131,6 +131,11 @@ class LicenseService {
   /// （拦新不杀旧的既有口径，见 hardBlocked 的注释）。
   bool _everUsable = false;
   bool get everUsable => _everUsable;
+
+  /// 最近一次授权请求是否因网络失败。与 stage 解耦：硬拦档位
+  /// （吊销/封禁等）在断网时被保留，此时 stage 不再是 unreachable，
+  /// 界面要判断「此刻到底是不是断网」只能看这里。
+  bool get netDown => _netDown;
   DateTime? get lastVerifiedAt => _lastVerifiedAt;
   String get deviceCode => DeviceIdentity.current;
 
@@ -507,6 +512,13 @@ class LicenseService {
 
   Future<LicenseResult> _verifyWithRetry() async {
     final r = await _verifyOnce();
+    // 断网→恢复的瞬间补发一次事件（stage 未变也要发）：激活页状态行的
+    // 「连接失败」快照靠它对齐回真实档位（吊销/封禁被保留时没有
+    // stage 事件可等）。幂等，纯通知。
+    if (_netRecovered) {
+      _netRecovered = false;
+      resync();
+    }
     if (r.ok && _stage != LicenseStage.unreachable) {
       _unreachableRetries = 0;
       return r;
@@ -596,7 +608,10 @@ class LicenseService {
       return r;
     }
     // 请求往返成功 = 网络恢复了（哪怕答复是否定）：清掉断网标记，
-    // 快速重试链到此收手，交回常规节奏。
+    // 快速重试链到此收手，交回常规节奏。标记「刚从断网恢复」：
+    // 硬拦档位被保留时 stage 不变、不会有事件，界面挂着的「连接失败」
+    // 快照就永远停摆——_verifyWithRetry 尾部据此补发一次事件。
+    if (_netDown) _netRecovered = true;
     _netDown = false;
     _authLog(_httpNote('/verify', _lastStatusCode, res['status']));
 
@@ -836,6 +851,10 @@ class LicenseService {
   /// 最近一次授权请求是否因网络失败（与 stage 解耦：硬拦档位被保留时
   /// stage 不再是 unreachable，快速重试链靠这个标记继续走）。
   bool _netDown = false;
+
+  /// 本次 _verifyOnce 是否经历了「断网 → 恢复」的跳变（见 _verifyWithRetry
+  /// 尾部的补发事件）。
+  bool _netRecovered = false;
 
   /// 大致多久之前。只用于给人看，不参与任何判定。
   String _ago(DateTime t) {

@@ -92,6 +92,11 @@ class _ActivationPageState extends State<ActivationPage> {
   /// 存分类不存 Color：initState 里就要写快照，那时拿不到 Theme。
   String _authTone = 'gray';
 
+  /// 断网时状态行的那句话（_headline(unreachable) 同文）。去重判断的
+  /// 基准：同一时刻整页只允许它出现一次——状态行挂着它时，激活提示行
+  /// 的断网失败就留空（那句重复的话由状态行承担）。
+  static const String _netFailLine = '授权服务器连接失败，请检查网络。';
+
   /// 弹窗里「点我去 TG 群」要跳的链接，激活页打开时向服务端取一次。
   /// 取不到就是空串，界面上不显示这个按钮——用户仍可以照下面写的
   /// 机器人命令去私聊机器人，那条路不依赖这个链接。
@@ -128,7 +133,15 @@ class _ActivationPageState extends State<ActivationPage> {
     // stream 是广播流，不归这一页所有：漏掉 cancel 的话，用户在首页和激活页之间
     // 来回切几次就会攒下好几个 setState，其中总有一个会打在已销毁的 State 上。
     _sub = _svc.changes.listen((_) {
-      if (mounted) setState(() {});
+      if (!mounted) return;
+      // 状态行还挂着「连接失败」而网络其实已恢复（快速重试链拿到了新
+      // 结论，但硬拦档位没变、不会有 stage 事件）——事件到来时把快照
+      // 对齐回真实档位，不让断网时的那句话一直盖着「已吊销」。
+      if (_authHeadline == _netFailLine && !_svc.netDown) {
+        _authHeadline = _headline(_svc.stage);
+        _authTone = _toneOf(_svc.stage);
+      }
+      setState(() {});
     });
   }
 
@@ -206,9 +219,13 @@ class _ActivationPageState extends State<ActivationPage> {
     setState(() {
       _busy = false;
       _busyAction = null;
-      // 激活失败也可能是因为连不上服务器：这时提示行留空，
-      // 那句重复的话由副标题（状态行）承担。
-      _tip = r.stage == LicenseStage.unreachable ? '' : r.message;
+      // 激活失败也可能是因为连不上服务器：状态行已挂着那句「连接失败」
+      // （刚按过重新校验）提示行就不再复述同一句；状态行还在说旧结论时
+      // 由提示行自己报一次。失败原因归提示行（红色），按钮保持可重试。
+      _tip = r.stage == LicenseStage.unreachable ||
+              (r.ok == false && _authHeadline == _netFailLine)
+          ? ''
+          : r.message;
       _actErr = !r.ok;
       // 失败不改按钮：失败原因在提示行报告（红色），按钮保持「激活」
       // 让用户随时可重试——按钮一旦变成别的名字，提示行里"点「激活」"
@@ -312,27 +329,36 @@ class _ActivationPageState extends State<ActivationPage> {
     });
     final r = await _svc.verify(force: true, source: '用户手动'); // 用户按钮：击穿 TTL
     if (!mounted) return;
-    // 授权校验结束：状态行刷新为本轮结论——「重新校验」这个按钮的
-    // 消息归它（用户原则：每个按钮对应一条消息）。
-    _authHeadline = _headline(_svc.stage);
-    _authTone = _toneOf(_svc.stage);
+    // 授权校验结束：一按一条消息，且只占状态行一行（一行信息的原则）。
+    //   断网 → 状态行就是那句「连接失败」；档位被保留（吊销/封禁等在
+    //     断网时原样保留，见 _handleUnreachable）也一样——重新校验这一按
+    //     问得出来的就是「连不上」，原结论等网络恢复的复核自己回来，
+    //     不靠叠第二行强调。
+    //   问出结论 → 状态行按档位说话。
+    // 消息行（_verifyMsg）只放「上次成功校验」这类事实尾巴，没有就留空
+    // ——它是补充信息，不是第二条消息，绝不复述状态行刚说过的话
+    //（2026-10-09 截图实测：两行只差一个句号的「连接失败」）。
     setState(() {
       _busy = false;
       _busyAction = null;
       _authErr = !r.ok;
-      // 校验的结果细节写在按钮上方的消息行：连不上时给出上次成功校验的
-      // 时间尾巴；「维持原结论」的断网答复（硬拦档位被保留，见
-      // _handleUnreachable）没有尾巴，就明写「连接失败」。通过后清空
-      // （状态行由结论快照承担）。
-      if (!r.ok) {
-        final tail = r.message
-            .replaceFirst('授权服务器连接失败，请检查网络', '')
-            .trim();
-        _verifyMsg = tail.isEmpty
-            ? '授权服务器连接失败，请检查网络'
-            : tail.replaceFirst('（', '').replaceFirst('）', '');
-      } else {
+      if (!r.ok && r.stage != LicenseStage.unreachable) {
+        _authHeadline = _netFailLine;
+        _authTone = 'red';
         _verifyMsg = '';
+      } else {
+        _authHeadline = _headline(_svc.stage);
+        _authTone = _toneOf(_svc.stage);
+        if (!r.ok) {
+          final tail = r.message
+              .replaceFirst('授权服务器连接失败，请检查网络', '')
+              .trim();
+          _verifyMsg = tail.isEmpty
+              ? ''
+              : tail.replaceFirst('（', '').replaceFirst('）', '');
+        } else {
+          _verifyMsg = '';
+        }
       }
     });
   }
@@ -858,7 +884,7 @@ class _ActivationPageState extends State<ActivationPage> {
       case LicenseStage.banned:
         return '客户端授权「已被封禁」，如有问题请联系管理员反馈。';
       case LicenseStage.unreachable:
-        return '授权服务器连接失败，请检查网络。';
+        return _netFailLine;
       case LicenseStage.unknown:
         // 冷启动/校验在途：进行时由按钮上方的消息行（_verifyMsg）单点
         // 报告「正在校验授权…」。副标题不再重复同样的话——两行一样的字
