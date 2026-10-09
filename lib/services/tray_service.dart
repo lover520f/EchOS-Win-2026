@@ -8,7 +8,6 @@ import 'package:window_manager/window_manager.dart';
 import 'app_paths.dart';
 import 'app_state.dart' show AppState, CheckStateKind;
 import 'license_service.dart';
-import 'log_service.dart';
 
 class TrayService with TrayListener {
   static final TrayService instance = TrayService._();
@@ -159,20 +158,17 @@ class TrayService with TrayListener {
     }
   }
 
-  /// 真正退出：先停代理恢复系统网络（否则系统代理残留），再结束进程。
+  /// 真正退出：走 AppState.shutdown() 的完整收尾（还原系统代理 → 停内核
+  /// → 写「退出时代理是否在运行」标记 → persist → 排空并关闭日志），与
+  /// 关窗隐藏、安装器退出同一条路径。原先只 stop() 不写状态，proxy-state
+  /// 停留在上一次会话的旧值，下次启动的自动恢复会无端拉起或静默失效。
   /// 窗口的关闭按钮在未激活时会走这条路（见 main.dart 的 _HideOnClose），
   /// 其余情况窗口的关闭按钮被拦截为「隐藏到托盘」，destroy 也会走同一条路，
   /// 所以退出进程必须直接 exit。
   Future<void> quit() async {
-    final app = _app;
-    if (app.isRunning || app.isStarting) {
-      await app.stop();
-    }
-    // 退出前排空日志队列：stop() 刚写的收尾日志（内核的
-    // `标准输入已关闭` / `[TUN] TUN 网卡已关闭` / `清理完成，退出`，
-    // 以及 Dart 侧的 `内核已退出（状态码 N）`）还在异步写队列里，
-    // exit(0) 一到就整段丢 —— 那正是排查 TUN 网卡有没有残留的唯一依据。
-    await LogService.instance.flush();
+    try {
+      await _app.shutdown();
+    } catch (_) {}
     exit(0);
   }
 

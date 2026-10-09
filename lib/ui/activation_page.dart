@@ -10,8 +10,9 @@
 //
 // ## 正式发版前请确认
 // 构建命令里带了 --dart-define=ECHOS_LICENSE_URL=https://<你的 worker>。
-// 没带的话 LicenseService 走 notConfigured 分支（不拦截），本页只能从主界面
-// 状态栏右侧的「授权」那一小条主动点进来——那意味着发出去的是一份拦不住人的包。
+// 没带的话 LicenseService 走 notConfigured 分支（不拦截），而 notConfigured
+// 永远不满足锁定口径——本页在那种构建里根本不会出现，等于发出去一份
+// 拦不住人的包。本页只由根节点按 uiLocked 整页接管进入，没有别的入口。
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -269,10 +270,12 @@ class _ActivationPageState extends State<ActivationPage> {
     if (!mounted) return;
     // 本地开发包（没注入授权地址）：真实用户永远到不了这一档，
     // 界面不留提示——暴露内部配置状态没有服务对象，排查靠 auth.log。
+    // _actionLine 归位回授权线，否则状态区停在一个空的 net 行上。
     if (!LicenseService.enabled) {
       setState(() {
         _busy = false;
         _busyAction = null;
+        _actionLine = null;
       });
       return;
     }
@@ -727,7 +730,7 @@ class _ActivationPageState extends State<ActivationPage> {
     );
   }
 
-  // 注册激活步骤的四行（不含小标题——标题由内层卡片二自己画）。
+  // 注册激活步骤的四行（不含小标题——「注册激活步骤」标题画在同一个卡片里）。
   // 四步讲完从复制设备码到激活的全流程；
   // 第 ④ 步的「点个Star」是真超链接，落到仓库主页。
   List<Widget> _stepItems(ThemeData t) {
@@ -792,7 +795,7 @@ class _ActivationPageState extends State<ActivationPage> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('公益项目，避免传播与滥用设置了注册激活机制，如有问题请提交issue。',
+        Text('公益项目，为避免传播与滥用，设置了注册激活机制，如有问题请提交 issue。',
             style: EchTheme.smallStyle(EchTheme.textMuted(t))),
         const SizedBox(height: 2),
         Wrap(

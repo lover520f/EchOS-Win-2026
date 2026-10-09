@@ -19,18 +19,22 @@ import 'ui/theme.dart';
 
 /// 点右上角关闭 → 隐藏到托盘（进程继续），真正退出走托盘「退出应用」。
 ///
-/// 未激活时是另一条路：直接退进程。留在托盘里等于留了一条绕开激活窗口的路——
-/// 用户关掉窗口，再从托盘「显示应用」，回来的是同一个激活窗口，可这中间
-/// 他完全可以去点别的入口。这条路一旦开着，拦截就只剩个界面效果。
+/// 未激活（锁定态）时是另一条路：直接退进程。留在托盘里等于留了一条
+/// 绕开激活窗口的路——用户关掉窗口，再从托盘「显示应用」，回来的是
+/// 同一个激活窗口，可这中间他完全可以去点别的入口。这条路一旦开着，
+/// 拦截就只剩个界面效果。锁定口径 = LicenseService.uiLocked（与主界面
+/// 门控、托盘菜单共用同一把锁）。
 ///
-/// 「连不上授权服务器」刻意不算这一类（见 LicenseService.hardBlocked）：那
-/// 多半是已激活用户赶上网络或服务端抖动，此刻照常隐藏到托盘，正在服务的
+/// 会话中途的「连不上授权服务器」刻意不算锁定（见 uiLocked）：那多半
+/// 是已激活用户赶上网络或服务端抖动，此刻照常隐藏到托盘，正在服务的
 /// 隧道不殃及，恢复后复查自动回到 active。若在这里一刀切退进程，等于
-/// 客户端替服务器执行了一次吊销。
+/// 客户端替服务器执行了一次吊销。启动即断网且从未可用属于锁定——
+/// 那台机器没有可保护的会话，关窗照锁定口径退出。
 class _HideOnClose with WindowListener {
   @override
   void onWindowClose() {
-    if (LicenseService.instance.hardBlocked) {
+    if (LicenseService.instance.bootstrapped &&
+        LicenseService.instance.uiLocked) {
       // 走托盘那套完整收尾（停内核 → 还原系统代理 → 排空日志）而不是裸 exit：
       // 用户可能是开着隧道时后台复查判定被吊销的，此刻系统代理还接管着，
       // 直接退出会给这台机器留下一个打不开网页的代理设置。
@@ -56,18 +60,14 @@ class _KeepCentered with WindowListener {
 /// 托盘驻留的空闲实例不发密集轮询（its 状态由推送、慢速兜底和任何
 /// 操作时的校验对齐）；用户把窗口亮出来的那一刻是最需要真相的时候——
 /// show 事件顺手补一发校验，配合 resume 校验双保险。事件万一不来
-/// （历史遗留的平台差异），uiVisible 默认 true，行为退回「照常轮询」，
-/// 安全降级。
+/// （历史遗留的平台差异），行为退回「照常轮询」，安全降级。
 class _WindowVis with WindowListener {
   @override
   void onWindowEvent(String eventName) {
     if (eventName == 'show') {
-      LicenseService.instance.uiVisible = true;
       // 窗口显示（启动首屏 / 托盘唤起 / 从托盘回前台都走这里）：
       // 用户可感知的事件，击穿 TTL
       LicenseService.instance.verify(force: true, source: '窗口显示');
-    } else if (eventName == 'hide') {
-      LicenseService.instance.uiVisible = false;
     }
   }
 }
@@ -277,6 +277,10 @@ class _EchOSAppState extends State<EchOSApp> with WidgetsBindingObserver {
   // 必须能把主界面收走，不能只提示一下就放人继续用。
   StreamSubscription<LicenseStage>? _licenseSub;
 
+  // 切断前隧道是否在跑：吊销/封禁切断时置位，恢复回 active 且隧道未起时
+  // 据此自动续跑（对称闭环，见监听器里的恢复分支）。
+  bool _tunnelWasRunning = false;
+
   // 显式记录当前亮度，替代 ThemeMode.system：Windows 桌面端在系统明暗来回
   // 切换时 platformBrightness 偶尔不主动通知重建，导致残留旧的深/浅色。
   // 这里监听 didChangePlatformBrightness 强制 setState，切换即刷新。
@@ -318,63 +322,14 @@ class _EchOSAppState extends State<EchOSApp> with WidgetsBindingObserver {
         app.log('[授权] 授权已恢复，自动续跑代理');
         unawaited(app.start());
       }
-      _syncActiveVerify();
       if (mounted) setState(() {});
     });
-    // 代理启停也驱动这条同步：运行中的隧道是吊销真正要切断的东西，
-    // 运行期间 5 分钟一查（空闲兜底的节奏对「还在跑的代理」太钝）。
-    AppState.instance.addListener(_syncActiveVerify);
   }
-
-  Timer? _activeVerifyTimer;
-  // 切断前隧道是否在跑：吊销/封禁切断时置位，恢复回 active 且隧道未起时
-  // 据此自动续跑（对称闭环，见监听器里的恢复分支）。
-  bool _tunnelWasRunning = false;
-  void _syncActiveVerify() {
-    final app = AppState.instance;
-    final running = app.isRunning || app.isStarting;
-    // 实时推送在线 = 秒级 resync 已覆盖，5 分钟轮询暂停（省额度）；
-    // 推送掉线 → 轮询自动恢复，节奏回到 5 分钟。
-    // unreachable 不算「被拦」：隧道还在跑，轮询要继续——否则一次网络
-    // 抖动过后，恢复全靠慢速兜底或用户聚焦窗口。
-    final pushLive = LicenseService.instance.pushLive;
-    if (running && !LicenseService.instance.hardBlocked && !pushLive) {
-      // 掉线兜底轮询：基础 5 分钟，持续掉线指数降档到 15 分钟封顶。
-      // 隧道在跑的客户端是"吊销真正要切断的对象"，刚掉线时最敏感，
-      // 掉得越久越降频（恢复态靠重连补课 verify + 回前台触发）。
-      if (_activeVerifyTimer == null || !_activeVerifyRunning) {
-        _activeVerifyRunning = true;
-        _activeVerifyTimer?.cancel();
-        _activeVerifyTimer = Timer.periodic(
-            const Duration(minutes: 5), (_) {
-          // 掉线感知的指数降档：刚掉线每个 tick（5 分钟）都问；
-          // 持续掉线 ≥10 分钟隔一个 tick 问一次（10 分钟档）；
-          // ≥20 分钟隔两个 tick（15 分钟档封顶）。掉得越久越省，
-          // 刚掉线那几分钟最敏感（吊销真正要切断的就是在跑的隧道）。
-          final mins = LicenseService.instance.pushOutageMinutes;
-          final step = mins >= 20 ? 3 : (mins >= 10 ? 2 : 1);
-          if (_activeVerifyTicks % step != 0) {
-            _activeVerifyTicks++;
-            return;
-          }
-          _activeVerifyTicks++;
-          // 自动来源（掉线兜底轮询）：服从 TTL，不 force
-        });
-      }
-    } else {
-      _activeVerifyTimer?.cancel();
-      _activeVerifyTimer = null;
-      _activeVerifyRunning = false;
-    }
-  }
-  bool _activeVerifyRunning = false;
-  int _activeVerifyTicks = 0;
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _licenseSub?.cancel();
-    _activeVerifyTimer?.cancel();
     super.dispose();
   }
 

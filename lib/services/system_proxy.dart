@@ -1,5 +1,6 @@
 // 系统代理驱动：Windows 注册表（HKCU Internet Settings）。
 import 'dart:convert';
+import 'dart:ffi';
 import 'dart:io';
 
 const String _regKey =
@@ -39,12 +40,14 @@ class SystemProxy {
       // Clash 的 10808），先提示，避免无声覆盖后两工具打架。
       final occupied = await _regQuerySz(_regKey, 'ProxyServer');
       final targetPort = httpPort ?? 30001;
-      final expected = '127.0.0.1:$targetPort';
+      final host = httpHost ?? '127.0.0.1';
+      final port = targetPort;
+      // expected 用与下方写入完全相同的 host:port：自定义监听地址（0.0.0.0
+      // 等）时，上次崩溃残留的自己的值不该被当成「其他工具」误警告。
+      final expected = '$host:$port';
       if (occupied != null && occupied.isNotEmpty && occupied != expected) {
         warns.add('检测到系统代理当前指向 $occupied（可能由其他代理工具设置），继续操作将覆盖它');
       }
-      final host = httpHost ?? '127.0.0.1';
-      final port = targetPort;
       final e1 = await _regSet(_regKey, 'ProxyEnable', 1);
       final e2 = await _regSetSz(_regKey, 'ProxyServer', '$host:$port');
       // 记住本工具写入的地址：运行期被抢占检测（stolenBy）靠它判定
@@ -122,13 +125,20 @@ class SystemProxy {
   }
 
   /// 代理地址（host:port 形式）是否还有进程在监听。
-  /// 解析不出端口的写法（分协议形式等）一律按「活着」处理——
-  /// 验活是尽力而为的防御，不能因为格式认不出就把用户配置改掉。
+  ///
+  /// 只对「IPv4/主机名:端口」这种无歧义形态真正探活；其余写法——分协议
+  /// 多段（http=..;https=..）、带认证串、IPv6 带方括号——解析歧义太大，
+  /// 探错对象会把用户**活着的**代理误判成死代理，restore 悄悄改成直连，
+  /// 比不验活更糟（2026-10-10 审计）。一律按「活着」处理。
   static Future<bool> _proxyAlive(String server) async {
-    final parts = server.split(':');
-    final host = parts.isEmpty || parts.first.isEmpty ? null : parts.first;
-    final port = parts.length > 1 ? int.tryParse(parts.last) : null;
-    if (host == null || port == null) return true;
+    final v = server.trim();
+    if (RegExp(r'^[A-Za-z0-9._-]+:\d{1,5}$').firstMatch(v) == null) {
+      return true;
+    }
+    final parts = v.split(':');
+    final host = parts.first;
+    final port = int.parse(parts.last);
+    if (port < 1 || port > 65535) return true;
     try {
       final s = await Socket.connect(host, port,
           timeout: const Duration(milliseconds: 800));
@@ -263,7 +273,15 @@ class SystemProxy {
       }
       await _regSet(_regKey, 'ProxyEnable', wasOn ? 1 : 0);
       if (wasOn) {
-        await _regSetSz(_regKey, 'ProxyServer', server.isNotEmpty ? server : '127.0.0.1:1080');
+        if (server.isNotEmpty) {
+          await _regSetSz(_regKey, 'ProxyServer', server);
+        } else {
+          // enable=1 但 ProxyServer 为空的备份组合：没有可还原的地址，
+          // 按关闭处理——凭空捏造 127.0.0.1:1080 之类的默认值等于开机
+          // 指向一个从未存在过的端口。
+          await _regSet(_regKey, 'ProxyEnable', 0);
+          await _regDelete(_regKey, 'ProxyServer');
+        }
       } else {
         await _regDelete(_regKey, 'ProxyServer');
       }
@@ -298,8 +316,23 @@ class SystemProxy {
     } catch (_) {}
   }
 
-  /// 广播设置变更让系统立即生效
+  /// 广播设置变更让系统立即生效。
+  ///
+  /// wininet 的 InternetSetOption（SETTINGS_CHANGED + REFRESH）才是 Win8+
+  /// 上刷新 WinINET 代理缓存的正道；rundll32 的 UpdatePerUserSystemParameters
+  /// 是 XP 时代手法——注册表写了但运行中的浏览器收不到通知，「接管了浏览器
+  /// 却不换代理」的偶发报告源于此。两条通知都发。
   static Future<void> _notifySettingChange() async {
+    try {
+      final wininet = DynamicLibrary.open('wininet.dll');
+      final setOption = wininet.lookupFunction<
+          Int32 Function(IntPtr, Int32, Pointer<Void>, Int32),
+          int Function(int, int, Pointer<Void>, int)>('InternetSetOptionW');
+      const internetOptionSettingsChanged = 39;
+      const internetOptionRefresh = 37;
+      setOption(0, internetOptionSettingsChanged, nullptr, 0);
+      setOption(0, internetOptionRefresh, nullptr, 0);
+    } catch (_) {}
     try {
       await Process.run(
           'rundll32.exe', ['user32.dll,UpdatePerUserSystemParameters'],

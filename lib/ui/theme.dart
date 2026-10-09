@@ -67,7 +67,7 @@ class EchTheme {
   // 全局字间距（用户要求"适当增加所有字体字间距"；HarmonyOS Sans 自身字距偏宽，0.25 恰当）
   static const double letterSpacing = 0.25;
 
-  // 统一字重 —— 只取 Noto Sans SC 的真实字重，杜绝假加粗糊字：
+  // 统一字重 —— 只取 HarmonyOS Sans SC 的真实字重，杜绝假加粗糊字：
   //   700 Bold    标题 + 行标签/分段（配置名醒目）
   //   500 Medium  内容：按钮/下拉/勾选/输入值
   //   400 Regular 弱化数据：日志行/状态文字/提示
@@ -161,7 +161,7 @@ class EchTheme {
     final base = ThemeData(
       useMaterial3: true,
       brightness: brightness,
-      // 全局字体：Noto Sans SC / 苹方，Avoid 字体回退造成中西文差异
+      // 全局字体：HarmonyOS Sans SC / 苹方，Avoid 字体回退造成中西文差异
       fontFamily: systemCJKFont,
       fontFamilyFallback:
           const ['HarmonyOS Sans SC', 'Microsoft YaHei', 'PingFang SC'],

@@ -1219,6 +1219,7 @@ class AppState extends ChangeNotifier {
   /// 下载更新包（镜像 Mac downloadUpdate → downloadDMG）。
   /// 进度经 notifyListeners 驱动 home_page 的进度面板；取消置 _cancelDownload。
   Future<void> downloadUpdate() async {
+    if (isDownloadingUpdate) return; // 防重入：并发下载会共写同一个 .part
     final info = updateInfo;
     if (info == null) return;
     _cancelDownload = false;

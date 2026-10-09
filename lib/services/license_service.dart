@@ -120,11 +120,6 @@ class LicenseService {
   LicenseStage get stage => _stage;
   String get message => _message;
 
-  /// 空闲轮询只服务「窗口可见」的实例（见 bootstrap 里的定时器注释）。
-  /// 由 main.dart 的窗口事件监听（show/hide）维护，默认 true——
-  /// 监听万一没挂上，行为退回「照常轮询」，安全降级。
-  bool uiVisible = true;
-
   /// bootstrap 是否完成（联网校验已出结果）。完成前的界面只显示
   /// 「正在校验授权…」的启动页，不显示主界面也不显示激活页——
   /// 两条路都不该在校验结果出来之前出现。
@@ -290,7 +285,7 @@ class LicenseService {
   /// 断线/失败按指数退避重连（5s→60s 封顶）；通道不可用不影响
   /// 任何判定——轮询节奏原样兜底。
   void _connectPush() {
-    if (!enabled || _wsConnecting || pushLive) return;
+    if (!enabled || disposed || _wsConnecting || pushLive) return;
     _wsConnecting = true;
     final base = baseUrl.replaceFirst(RegExp(r'^http'), 'ws');
     WebSocket.connect('$base/ws').then((ws) {
@@ -309,7 +304,11 @@ class LicenseService {
       _lastPongAt = DateTime.now();
       _startPing(ws);
       // 通道上线也广播一次内部事件：主界面侧据此暂停运行期轮询。
-      if (!_changes.isClosed) _changes.add(_stage);
+      // 同样只在翻转时发（对照 _schedulePushReconnect）。
+      if (_lastPushLiveEvent != true && !_changes.isClosed) {
+        _lastPushLiveEvent = true;
+        _changes.add(_stage);
+      }
       // 重连成功立即补一课（0~5 秒随机延迟）：resync 广播不持久化，
       // 掉线窗口里管理端做过的操作（吊销/恢复/换码）永远不会再推来，
       // 掉线前的旧状态要靠这次主动校验对齐。随机延迟把「全量客户端
@@ -331,13 +330,20 @@ class LicenseService {
           verify(force: true, source: 'resync推送');
         }
       }, onDone: () {
+        // 迟到的收尾事件守卫：旧连接的 close 可能在新连接已建成后送达，
+        // 无条件清空会把新连接的引用与心跳一起杀掉（多 socket 并存、
+        // pushLive 恒 false 的根源）。
+        if (!identical(_ws, ws)) return;
         _ws = null;
         _stopPing();
+        _wsOutageStart ??= DateTime.now();
         _authLog('推送通道断开（对端关闭），自动重连中');
         _schedulePushReconnect();
       }, onError: (e) {
+        if (!identical(_ws, ws)) return;
         _ws = null;
         _stopPing();
+        _wsOutageStart ??= DateTime.now();
         _authLog('推送通道出错（${describeNetError(e) ?? e.runtimeType}），自动重连中');
         _schedulePushReconnect();
       });
@@ -354,9 +360,17 @@ class LicenseService {
     _wsBackoff++;
     _wsRetry?.cancel();
     _wsRetry = Timer(delay, _connectPush);
-    // 掉线也要让主界面侧知道：恢复运行期轮询。
-    if (!_changes.isClosed) _changes.add(_stage);
+    // 掉线也要让主界面侧知道：恢复运行期轮询。只在「在线→掉线」翻转时
+    // 发一次——退避期内每次排程都发的话，5~60s 一个的事件风暴会拖着
+    // 整棵 UI 树空转，信息量却为零。
+    if (_lastPushLiveEvent != false && !_changes.isClosed) {
+      _lastPushLiveEvent = false;
+      _changes.add(_stage);
+    }
   }
+
+  /// 推送通道「在线/掉线」上次广播的状态：事件只在翻转时发。
+  bool? _lastPushLiveEvent;
 
   /// 30 秒一次心跳：发 ping，10 秒内没等到 pong 视同半开连接，
   /// 主动断开走重连。静默死掉的 WS 若无此探活，可能长时间不报错。
@@ -452,6 +466,10 @@ class LicenseService {
     _resyncConfirm?.cancel();
     _negConfirm?.cancel();
     _cutRecheck?.cancel();
+    _wsRetry?.cancel();
+    _stopPing();
+    _ws?.close();
+    _ws = null;
     _timer = null;
     _changes.close();
   }
@@ -549,7 +567,8 @@ class LicenseService {
       _unreachableRetries++;
       _quickRetry?.cancel();
       _quickRetry = Timer(const Duration(seconds: 5), () {
-        if (_netDown) verify(source: '失败重试');
+        if (disposed || !_netDown) return;
+        verify(source: '失败重试');
       });
     }
     return r;
@@ -679,6 +698,9 @@ class LicenseService {
         return const LicenseResult(true, LicenseStage.active, '');
       case 'pending':
         // 服务端已经给这台设备发过码，只是人还没填进去。
+        // TTL 与 revoked/code_mismatch 同口径清掉：否定复核不带 force，
+        // TTL 残留会把 20 秒后的复核吞掉，旧状态最长压一小时。
+        _revalidateAt = null;
         _authLog('尚未完成激活：服务端已签发激活码，等待用户填入领取');
         if (!_shouldApplyNegative(LicenseStage.codeIssued, res['updatedAt'] as String? ?? '')) {
           return const LicenseResult(true, LicenseStage.codeIssued, '');
@@ -699,6 +721,9 @@ class LicenseService {
         // 封禁（黑名单）与吊销同处置：立即停代理，不进复核。
         // 封禁不在 license 记录上、没有时间戳可比；且管理语义就是
         // 「此人不可用」——立即停是唯一正确的处置。
+        // TTL 一并清掉：封禁后的切断复检/掉线轮询都不带 force，TTL 残留
+        // 会让「管理员解封」的感知从分钟级拖到小时级。
+        _revalidateAt = null;
         _lastVerifiedAt = null;
         _saveLocal();
         _authLog('校验未通过：该账号已被管理员封禁，名下设备全部停用');
@@ -749,7 +774,20 @@ class LicenseService {
         _authLog('校验被限流：维持上一次结论，$waitSec 秒后自动重试');
         return LicenseResult(true, _stage, _message);
       default:
-        // 服务端加了新状态而客户端版本旧了。宁可拦住也不能当成已激活放过去。
+        // 服务端加了新状态而客户端版本旧了（或网关返回了可解析但看不懂
+        // 的 JSON）。宁可拦住也不能当成已激活放过去——但**不得覆写硬拦
+        // 档位**：与 _handleUnreachable 同一条不变量，否则吊销/封禁中的
+        // 客户端遇到一次「看不懂的答复」就把主界面放回来了。
+        _netDown = true;
+        switch (_stage) {
+          case LicenseStage.revoked:
+          case LicenseStage.banned:
+          case LicenseStage.unregistered:
+          case LicenseStage.codeIssued:
+            return LicenseResult(false, _stage, netFailHeadline);
+          default:
+            break;
+        }
         _authLog('校验未通过：服务端返回了无法识别的状态「${res['status']}」，'
             '可能是服务端已升级而客户端版本偏旧');
         _set(LicenseStage.unreachable, '授权校验返回了无法识别的结果');
@@ -812,7 +850,7 @@ class LicenseService {
         '暂维持本机可用，20 秒后自动复核；复核仍是否定将立即拦下。');
     _negConfirm?.cancel();
     _negConfirm = Timer(const Duration(seconds: 20), () {
-      if (!_changes.isClosed) verify(source: '否定复核');
+      if (!_changes.isClosed) verify(force: true, source: '否定复核');
     });
     return false;
   }
@@ -917,7 +955,7 @@ class LicenseService {
     final sw = Stopwatch()..start();
     Object? err;
     var ok = await _probeHost(host, viaProxy: false, onErr: (e) => err = e);
-    if (!ok && _systemProxyOn()) {
+    if (!ok && await _systemProxyOn()) {
       ok = await _probeHost(host, viaProxy: true, onErr: (e) => err = e);
     }
     sw.stop();
@@ -952,22 +990,42 @@ class LicenseService {
 
   Future<String> fetchInviteLink() async {
     if (!enabled) return '';
+    // 与授权请求同一条降级链：直连被掐的环境里（恰恰是最需要这个按钮
+    // 的环境），缓存永远写不进——直连失败再兜一发系统代理。
+    for (final viaProxy in [false, true]) {
+      if (viaProxy && !await _systemProxyOn()) break;
+      final v = await _fetchInviteOnce(viaProxy);
+      if (v.isNotEmpty) {
+        if (viaProxy) _authLog('邀请链接直连失败，经系统代理获取成功');
+        // 取到就落一份本地缓存：断网时激活页靠它保住「点我去 TG 群」
+        // 按钮——入口不因网络消失，没网的时候恰恰最需要照着去求助。
+        _saveInviteCache(v);
+        return v;
+      }
+    }
+    return '';
+  }
+
+  Future<String> _fetchInviteOnce(bool viaProxy) async {
     final c = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 6)
-      ..findProxy = (_) => 'DIRECT';
+      ..connectionTimeout = const Duration(seconds: 6);
+    if (viaProxy) {
+      final p = _systemProxyAddr();
+      c.findProxy = (uri) => p == null ? 'DIRECT' : 'PROXY $p';
+    } else {
+      c.findProxy = (_) => 'DIRECT';
+    }
     try {
       final req = await c.getUrl(Uri.parse('$baseUrl/client-config'));
       final res = await req.close().timeout(const Duration(seconds: 8));
       if (res.statusCode < 200 || res.statusCode >= 300) return '';
-      final decoded =
-          jsonDecode(await res.transform(utf8.decoder).join());
+      final decoded = jsonDecode(await res
+          .transform(utf8.decoder)
+          .join()
+          .timeout(const Duration(seconds: 8)));
       if (decoded is! Map) return '';
       final link = decoded['inviteLink'];
-      final v = link is String ? link.trim() : '';
-      // 取到就落一份本地缓存：断网时激活页靠它保住「点我去 TG 群」
-      // 按钮——入口不因网络消失，没网的时候恰恰最需要照着去求助。
-      if (v.isNotEmpty) _saveInviteCache(v);
-      return v;
+      return link is String ? link.trim() : '';
     } catch (_) {
       return '';
     } finally {
@@ -1103,54 +1161,83 @@ class LicenseService {
   Future<Map<String, dynamic>?> _post(String path, Map<String, dynamic> body) async {
     final direct = await _postOnce(path, body, viaProxy: false);
     if (direct != null) return direct;
-    if (!_systemProxyOn()) return null;
+    if (!await _systemProxyOn()) return null;
     final viaSys = await _postOnce(path, body, viaProxy: true);
     if (viaSys != null) {
-      _authLog('$path 直连失败，经系统代理重试成功（后续校验维持此路径）');
+      _authLog('$path 直连失败，经系统代理重试成功');
     }
     return viaSys;
   }
 
-  /// 系统代理注册表键（与 SystemProxy 同一处，这里只读不写）。
+  // 系统代理查询结果缓存：直连被掐的环境里每次失败校验都会走到这里，
+  // reg.exe 查询不能在 UI isolate 上反复同步跑（spawn cmd+reg 常态
+  // 15-60ms，AV 忙时更久），也不能每次都 spawn——60 秒内复用。
   static const String _proxyRegKey =
       r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings';
+  static DateTime? _sysProxyCheckedAt;
+  static bool _sysProxyOnCache = false;
+  static String? _sysProxyAddrCache;
 
   /// 系统代理是否处于启用状态（ProxyEnable=1 且 ProxyServer 有值）。
-  /// 没开就没有兜底可试，跳过第二发。
-  static bool _systemProxyOn() {
+  /// 没开就没有兜底可试，跳过第二发。查询结果缓存 60 秒，
+  /// 地址落在 _sysProxyAddrCache 供 _systemProxyAddr() 读取。
+  static Future<bool> _systemProxyOn() async {
+    final now = DateTime.now();
+    final checked = _sysProxyCheckedAt;
+    if (checked != null && now.difference(checked).inSeconds < 60) {
+      return _sysProxyOnCache;
+    }
+    final on = await _regDword('ProxyEnable');
+    final server = on ? await _regSz('ProxyServer') : null;
+    _sysProxyOnCache = on && server != null && server.isNotEmpty;
+    _sysProxyAddrCache = _sysProxyOnCache ? _parseProxyAddr(server!) : null;
+    _sysProxyCheckedAt = now;
+    return _sysProxyOnCache;
+  }
+
+  /// 系统代理地址（host:port）。_systemProxyOn() 之后才有效。
+  static String? _systemProxyAddr() => _sysProxyAddrCache;
+
+  /// ProxyServer 多段格式（http=..;https=..;ftp=..）优先取 https 段，
+  /// 退而取最后一段带寻址信息的；单段原样返回。
+  static String _parseProxyAddr(String raw) {
+    var v = raw.trim();
+    if (v.contains(';')) {
+      final parts = v.split(';');
+      v = parts.firstWhere((p) => p.trim().startsWith('https='),
+          orElse: () => '');
+      if (v.trim().isEmpty) {
+        v = parts.last;
+      }
+      if (v.contains('=')) v = v.split('=').last;
+    }
+    v = v.trim();
+    return v;
+  }
+
+  static Future<String?> _regSz(String value) async {
     try {
-      final r = Process.runSync(
-          'reg', ['query', _proxyRegKey, '/v', 'ProxyEnable'], runInShell: true);
-      if (!(r.stdout as String).contains('0x1')) return false;
-      final s = Process.runSync(
-          'reg', ['query', _proxyRegKey, '/v', 'ProxyServer'], runInShell: true);
-      final line = (s.stdout as String)
-          .split('\n')
-          .where((l) => l.contains('REG_SZ'))
-          .firstOrNull;
-      return line != null && line.split('REG_SZ').last.trim().isNotEmpty;
+      final r = await Process.run(
+          'reg', ['query', _proxyRegKey, '/v', value], runInShell: true);
+      if (r.exitCode != 0) return null;
+      for (final l in (r.stdout as String).split('\n')) {
+        if (l.contains('REG_SZ')) {
+          return l.substring(l.indexOf('REG_SZ') + 6).trim();
+        }
+      }
+      return null;
     } catch (_) {
-      return false;
+      return null;
     }
   }
 
-  /// 系统代理地址（host:port）。只取 https 段或最后一段，解析不出返回 null。
-  static String? _systemProxyAddr() {
+  static Future<bool> _regDword(String value) async {
     try {
-      final s = Process.runSync(
-          'reg', ['query', _proxyRegKey, '/v', 'ProxyServer'], runInShell: true);
-      final line = (s.stdout as String)
-          .split('\n')
-          .where((l) => l.contains('REG_SZ'))
-          .firstOrNull;
-      var v = line?.split('REG_SZ').last.trim() ?? '';
-      if (v.contains(';')) {
-        v = v.split(';').last;
-        if (v.contains('=')) v = v.split('=').last;
-      }
-      return v.isEmpty ? null : v;
+      final r = await Process.run(
+          'reg', ['query', _proxyRegKey, '/v', value], runInShell: true);
+      return (r.stdout as String).contains('0x1');
     } catch (_) {
-      return null;
+      return false;
     }
   }
 
@@ -1169,7 +1256,14 @@ class LicenseService {
       req.headers.contentType = ContentType.json;
       req.write(jsonEncode(body));
       final res = await req.close().timeout(const Duration(seconds: 10));
-      final text = await res.transform(utf8.decoder).join();
+      // 响应头到了不等于 body 会来：劣质代理/半开连接能让 join 永久挂起，
+      // 而在途合并会让一个挂死的请求冻结整个授权状态机（表现：重新校验
+      // 永远转圈、激活永久排队，唯一出路重启进程）。body 读取同样限时，
+      // 超时按网络失败走兜底链。
+      final text = await res
+          .transform(utf8.decoder)
+          .join()
+          .timeout(const Duration(seconds: 10));
       // 服务端的 4xx 是应用层答复（unknown_device / invalid_code /
       // already_active…），不是传输失败——照常解码交给调用方按 status
       // 分流。未登记设备在服务端就是 404 + unknown_device，
@@ -1334,7 +1428,7 @@ class LicenseService {
       if (_changes.isClosed || _cutRecheckCount <= 0) return;
       _cutRecheckCount--;
       _authLog('切断后复检（剩余 $_cutRecheckCount 次）：确认服务端最新状态');
-      verify(source: '切断复检');
+      verify(force: true, source: '切断复检');
       if (_cutRecheckCount > 0) {
         _scheduleCutRecheck(const Duration(seconds: 90));
       }

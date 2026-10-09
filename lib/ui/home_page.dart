@@ -206,7 +206,14 @@ return;
             }),
           ],
         ),
-      );
+      ).whenComplete(() {
+        // 点遮罩关闭不经过按钮：不复位的话 _alertShowing 永久卡在 true，
+        // 本次会话所有后续全局弹窗（端口占用确认、更新提示…）全部静默失灵。
+        if (mounted) {
+          _alertShowing = false;
+          _maybeShowAlerts();
+        }
+      });
     }
   }
   // 窗口与可视区(去任务栏/菜单栏/Dock)边缘的留白量（逻辑像素）。
@@ -585,9 +592,9 @@ class _ServerGroup extends StatelessWidget {
                 PopupMenuItem(value: 'rl', child: const Text('从本地文件还原…')),
                 const PopupMenuDivider(),
                 PopupMenuItem(value: 'ws', child: const Text('WebDAV 设置…')),
-                PopupMenuItem(value: 'bw', child: const Text('「备份」到远程WebDAV')),
-                PopupMenuItem(value: 'rw', child: const Text('从远程WebDAV「还原」备份')),
-                PopupMenuItem(value: 'dw', child: const Text('「删除」远程WebDAV备份')),
+                PopupMenuItem(value: 'bw', child: const Text('「备份」到远程 WebDAV')),
+                PopupMenuItem(value: 'rw', child: const Text('从远程 WebDAV「还原」备份')),
+                PopupMenuItem(value: 'dw', child: const Text('「删除」远程 WebDAV 备份')),
               ],
               onSelected: (v) {
                 switch (v) {
@@ -1601,9 +1608,8 @@ class _BottomBlock extends StatelessWidget {
                     letterSpacing: EchTheme.letterSpacing,
                     color: EchTheme.textMuted(Theme.of(context)))),
             const SizedBox(width: 12),
-            // 授权状态常驻在状态栏右侧：激活页只在被拦时才弹，用户平时看不到自己
-            // 是不是还剩几天宽限、当前校验时间是什么时候。点进去就是激活页，
-            // 那里既能看状态，也能重新填码（换机器、重装系统后都是这条路）。
+            // 授权状态常驻在状态栏右侧：纯展示的「凭证位」——激活页由根节点
+            // 按 uiLocked 整页接管，不从这里进（此前的点击入口是死路）。
             const _LicenseChip(),
           ]),
           const SizedBox(height: 10),

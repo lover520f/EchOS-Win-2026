@@ -98,7 +98,12 @@ class Updater {
         final req =
             await c.getUrl(Uri.parse(url)).timeout(Duration(seconds: timeoutSec));
         final r = await req.close().timeout(Duration(seconds: timeoutSec));
-        return await r.transform(utf8.decoder).join();
+        // body 读取同样限时：响应头到了 body 停滞的半开连接会让 join
+        // 永久挂起（与 license_service 同款冻结问题）。
+        return await r
+            .transform(utf8.decoder)
+            .join()
+            .timeout(Duration(seconds: timeoutSec));
       } catch (e) {
         last = e;
       } finally {
@@ -189,43 +194,62 @@ class Updater {
       // 重新走「系统代理→直连」的建立链，临时文件从头重写（更新包无断点
       // 续传，重下是唯一安全的恢复；用户取消不受影响）。
       for (var attempt = 1; attempt <= 2; attempt++) {
+        // 先系统代理，失败降级直连；非 200 同样换通道——代理活着但对该
+        // 资源返回错误（出口规则/403）时，直连可能照样能下，不能短路。
         HttpClientResponse? resp;
+        HttpClient? opened;
         for (final viaProxy in [true, false]) {
           final c = _client(viaProxy: viaProxy);
+          HttpClientResponse? r;
           try {
             final req = await c.getUrl(Uri.parse(url));
-            resp = await req.close().timeout(const Duration(seconds: 30));
-            break;
+            r = await req.close().timeout(const Duration(seconds: 30));
           } catch (_) {
-            c.close();
-            resp = null;
+            c.close(force: true);
+            continue;
           }
+          if (r.statusCode == 200) {
+            resp = r;
+            opened = c;
+            break;
+          }
+          // 非 200：排干 body（避免连接挂起）后换通道
+          try {
+            await r.drain<void>();
+          } catch (_) {}
+          c.close(force: true);
         }
-        if (resp == null || resp.statusCode != 200) {
-          return DownloadOutcome(false, false, '');
+        if (resp == null || opened == null) {
+          break; // 两条通道都建不起来
         }
         final total = resp.contentLength;
         final sink = tmp.openWrite();
         var written = 0;
         var streamed = false;
+        var cancelled = false;
         try {
           await for (final chunk in resp) {
             if (isCancelled != null && isCancelled()) {
-              await sink.close();
-              if (tmp.existsSync()) tmp.deleteSync();
-              return DownloadOutcome(false, true, '');
+              cancelled = true;
+              break;
             }
             sink.add(chunk);
             written += chunk.length;
             if (total > 0) onProgress(written / total);
           }
           await sink.close();
-          streamed = true;
+          streamed = !cancelled;
         } catch (_) {
           // 中途断流：关掉半截文件，落到下一轮 attempt 重新建立连接
           try {
             await sink.close();
           } catch (_) {}
+        } finally {
+          opened.close(force: true);
+        }
+        if (cancelled) {
+          if (tmp.existsSync()) tmp.deleteSync();
+          return DownloadOutcome(false, true, '');
         }
         if (streamed) {
           if (target.existsSync()) target.deleteSync();
@@ -233,7 +257,14 @@ class Updater {
           onProgress(1);
           return DownloadOutcome(true, false, target.path);
         }
+        // 断流：删掉半截文件，下一轮从头重下
+        try {
+          if (tmp.existsSync()) tmp.deleteSync();
+        } catch (_) {}
       }
+      try {
+        if (tmp.existsSync()) tmp.deleteSync();
+      } catch (_) {}
       return DownloadOutcome(false, false, '');
     } catch (_) {
       try {
@@ -259,13 +290,13 @@ class Updater {
     final releaseUrl =
         'https://api.github.com/repos/$geoRepo/releases/latest';
     try {
-      final r = await HttpClient()
-          .getUrl(Uri.parse(releaseUrl))
-          .then((h) => h.close())
-          .timeout(const Duration(seconds: 15));
-      final j = jsonDecode(await r.transform(utf8.decoder).join())
-          as Map<String, dynamic>;
+      // release 检查走 _getBody（先系统代理后直连）：裸 HttpClient 直连
+      // api.github.com 在国内环境常年失败——「分流数据：下载失败/检查失败」
+      // 的直接原因（下载本身早有两级通道，检查这步却一直裸奔）。
+      final text = await _getBody(releaseUrl, timeoutSec: 15);
+      final j = jsonDecode(text) as Map<String, dynamic>;
       final tag = (j['tag_name'] as String?) ?? '';
+      if (tag.isEmpty) return '分流数据：检查失败（GitHub 返回异常）';
       final local = localGeoVersion();
       if (!force && local == tag && hasLocalGeoData()) {
         return '分流数据：已是最新（v$tag）';

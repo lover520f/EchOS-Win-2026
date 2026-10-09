@@ -322,12 +322,18 @@ Future<({bool ok, String? err})> _saveFile(
 
 /// 弹出「打开」对话框，返回所选文件路径；用户取消返回 null。
 Future<String?> _openFile(List<String> extensions) async {
-  final f = await FilePicker.pickFile(
-    dialogTitle: '选择文件',
-    type: FileType.custom,
-    allowedExtensions: extensions,
-  );
-  return f?.path;
+  // file_picker 在「已有选择框在打开」/COM 初始化失败等场景会 throw，
+  // 不吞的话导入/还原两个入口直接以未捕获异常收场（与 _saveFile 对称）。
+  try {
+    final f = await FilePicker.pickFile(
+      dialogTitle: '选择文件',
+      type: FileType.custom,
+      allowedExtensions: extensions,
+    );
+    return f?.path;
+  } catch (_) {
+    return null;
+  }
 }
 
 Future<bool> _confirm(BuildContext context, String title, String message) async {
@@ -571,27 +577,33 @@ class _EchDialogButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      height: 40,
-      child: Material(
-        type: MaterialType.transparency,
-        borderRadius: BorderRadius.circular(10),
-        child: InkWell(
-          onTap: onPressed,
+    // onPressed 为 null = 禁用：必须给出与 AppButton 一致的观感（半透明 +
+    // 基础光标），否则「点了没反应的按钮」——WebDAV 设置的保存就曾是这副样子。
+    final disabled = onPressed == null;
+    return Opacity(
+      opacity: disabled ? 0.45 : 1,
+      child: SizedBox(
+        height: 40,
+        child: Material(
+          type: MaterialType.transparency,
           borderRadius: BorderRadius.circular(10),
-          child: Container(
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              color: bg,
-              borderRadius: BorderRadius.circular(10),
+          child: InkWell(
+            onTap: onPressed,
+            borderRadius: BorderRadius.circular(10),
+            child: Container(
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: bg,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Text(label,
+                  style: TextStyle(
+                      fontSize: EchTheme.fsTool,
+                      fontWeight: EchTheme.fwContent,
+                      color: fg,
+                      letterSpacing: EchTheme.letterSpacing,
+                      height: 1.3)),
             ),
-            child: Text(label,
-                style: TextStyle(
-                    fontSize: EchTheme.fsTool,
-                    fontWeight: EchTheme.fwContent,
-                    color: fg,
-                    letterSpacing: EchTheme.letterSpacing,
-                    height: 1.3)),
           ),
         ),
       ),

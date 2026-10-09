@@ -376,6 +376,10 @@ class KernelManager {
       const names = 'x-tunnel.exe';
       final path = kernelPath();
       final baseDir = path != null ? File(path).parent.path : null;
+      // 内核文件缺失（安装残缺/被杀软隔离）时拿不到归属目录：跳过清理。
+      // 归属校验是防误杀的命门——拿不到它还继续，就会对全机同名进程
+      // taskkill，包括别的目录里碰巧同名的进程。
+      if (baseDir == null) return;
       final r = await Process.run(
           'tasklist', ['/FI', 'IMAGENAME eq $names', '/FO', 'CSV'],
           runInShell: true);
@@ -394,8 +398,9 @@ class KernelManager {
         // 用 PowerShell 取得可执行路径，核对来自内核目录（防误杀同名单进程）。
         // 不能用 wmic：Win11 24H2 起已移除 wmic（docs/archive/授权流程.md 第二节
         // 同款注意事项），它一失败这里拿到的就是空路径 → 全部 continue →
-        // 一个残留都杀不掉，静默失效。
-        if (baseDir != null) {
+        // 一个残留都杀不掉，静默失效。（baseDir 已在函数头判空提前返回，
+        // 这里必然非空。）
+        {
           final w = await Process.run('powershell.exe', [
             '-NoProfile',
             '-NonInteractive',
