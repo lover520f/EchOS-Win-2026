@@ -97,10 +97,12 @@ class TrayService with TrayListener {
   @override
   void onTrayMenuItemClick(MenuItem menuItem) {
     final app = _app;
-    // 未激活时只放行「显示应用」和「退出」。菜单已经按 blocked 缩减过一版，
-    // 这里再挡一道：原生菜单的重建有 IPC 往返，授权刚被吊销到菜单刷新之间
-    // 存在一个窗口，那一下点击必须落空。
-    if (LicenseService.instance.blocked &&
+    // 界面被锁（激活页）时只放行「显示应用」和「退出」。菜单已经按
+    // uiLocked 缩减过一版，这里再挡一道：原生菜单的重建有 IPC 往返，
+    // 授权刚变化到菜单刷新之间存在一个窗口，那一下点击必须落空。
+    // 会话中途的 unreachable 不算锁：代理开关放行给 _toggleWithVerify，
+    // 由它先校验再决定（被拦时亮窗说明原因）。
+    if (LicenseService.instance.uiLocked &&
         menuItem.key != 'show' &&
         menuItem.key != 'quit') {
       return;
@@ -179,16 +181,20 @@ class TrayService with TrayListener {
   /// 自绘标签表导致「只有底色、无文字」，稍等/重开才恢复。
   String? _menuSig;
 
-  Future<void> _rebuildMenu() async {
+  Future<void> _rebuildMenu({bool force = false}) async {
     final app = _app;
-    final blocked = LicenseService.instance.blocked;
+    // 缩减口径与主界面门控同一把锁（LicenseService.uiLocked）：被服务器
+    // 明确拒绝、或启动以来从未可用——主界面进不去，菜单才缩；会话中途
+    // 的 unreachable 不缩（隧道还跑着，代理开关点击自有一层校验兜底，
+    // 被拦时亮窗说明原因），否则一次网络抖动就把托盘掏空。
+    final locked = LicenseService.instance.uiLocked;
     // v2rayN 风格：运行状态用行首实心圆点表达（开=有点，关=没点），文案固定
     final running = app.isRunning || app.isStarting;
     final servers = app.config.servers;
-    // blocked 进指纹：授权状态变了菜单要跟着换，靠 AppState 的通知是收不到的
+    // 锁定态进指纹：授权状态变了菜单要跟着换，靠 AppState 的通知是收不到的
     // （LicenseService 是另一个单例，两者互不相干）。
     final sig = [
-      blocked,
+      locked,
       running,
       app.config.tunMode,
       app.config.showDockIcon,
@@ -196,12 +202,12 @@ class TrayService with TrayListener {
       app.selected?.id,
       ...servers.map((s) => '${s.id}:${s.name}'),
     ].join('|');
-    if (sig == _menuSig) return;
+    if (!force && sig == _menuSig) return;
     _menuSig = sig;
     // 未激活时只剩「显示应用」和「退出」。留着代理开关、TUN、服务器切换这些
     // 项没有意义——主界面根本进不去，点了只是改一些此刻用不上的配置，
     // 还让人以为程序在正常跑。
-    if (blocked) {
+    if (locked) {
       try {
         await trayManager.setContextMenu(Menu(items: [
           MenuItem(key: 'show', label: '显示应用'),
@@ -267,7 +273,15 @@ class TrayService with TrayListener {
   }
 
   // 右键托盘：菜单由原生侧在收到 WM_RBUTTONUP 时直接弹出（跟随鼠标位置），
-  // 不再经 Dart 往返，因此这里无需覆写 onTrayIconRightMouseDown。
+  // 不再经 Dart 往返。但 DOWN 到 UP 之间有一次自愈机会：setContextMenu
+  // 恰逢菜单已打开时会把原生侧的自绘标签表清空（弹出只有底色没有文字），
+  // 而内容指纹未变时按指纹跳过的重建永远不会再来——损坏就成了永久
+  //（2026-10-09 实测：菜单先因断网缩减、再点开就全空）。DOWN 时菜单必然
+  // 处于关闭态，强制重设一次当前菜单是安全的：坏过就修复，没坏也无害。
+  @override
+  void onTrayIconRightMouseDown() {
+    _rebuildMenu(force: true);
+  }
 
   /// 把打包的托盘图标写为临时文件供托盘显示（蓝=已接管，橙=未接管）
   Future<void> _writeIcons() async {

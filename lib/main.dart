@@ -413,14 +413,13 @@ class _EchOSAppState extends State<EchOSApp> with WidgetsBindingObserver {
           // 照跑，用户看到的就是「弹窗了却不断网」。unreachable 留在主界面
           // 由状态栏红字提示，拦新不杀旧，重试由客户端自动重试链承担。
           //
-          // 例外：**启动首验就是 unreachable** 且从未可用过（everUsable）——
-          // 这台机器此刻连「上一秒还好好的」都没有，主界面没有可保的会话，
-          // 拦新就该连界面一起拦：落在激活页（授权弹窗）等自动重试链拉回，
-          // 那里有「检查网络」按钮，正是 unreachable 的自助入口；一旦校验
-          // 通过，changes 事件自动切回主界面。
-          : LicenseService.instance.hardBlocked ||
-                  (LicenseService.instance.stage == LicenseStage.unreachable &&
-                      !LicenseService.instance.everUsable)
+          // 例外：**启动首验就是 unreachable** 且从未可用过——这台机器此刻
+          // 连「上一秒还好好的」都没有，主界面没有可保的会话，拦新就该连
+          // 界面一起拦：落在激活页（授权弹窗）等自动重试链拉回，那里有
+          // 「检查网络」按钮，正是 unreachable 的自助入口；一旦校验通过，
+          // changes 事件自动切回主界面。口径收在 LicenseService.uiLocked，
+          // 托盘菜单的缩减用的是同一把锁。
+          : LicenseService.instance.uiLocked
               ? const ActivationPage()
               : const HomePage(),
     );

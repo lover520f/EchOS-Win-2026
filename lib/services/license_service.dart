@@ -139,6 +139,14 @@ class LicenseService {
   bool _everUsable = false;
   bool get everUsable => _everUsable;
 
+  /// 界面是否被锁在激活页（主界面进不去）。main.dart 的 home 门控与
+  /// 托盘菜单的缩减共用这一个口径：hardBlocked（服务器明确说不），或
+  /// 「本次运行从未可用」的 unreachable（拦新也要拦界面）；会话中途的
+  /// unreachable 不锁——隧道和主界面都留着（拦新不杀旧），托盘的
+  /// 代理开关自有一层校验兜底（见 TrayService._toggleWithVerify）。
+  bool get uiLocked =>
+      hardBlocked || (_stage == LicenseStage.unreachable && !_everUsable);
+
   /// 最近一次授权请求是否因网络失败。与 stage 解耦：硬拦档位
   /// （吊销/封禁等）在断网时被保留，此时 stage 不再是 unreachable，
   /// 界面要判断「此刻到底是不是断网」只能看这里。
