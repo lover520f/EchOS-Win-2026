@@ -66,13 +66,9 @@ class _ActivationPageState extends State<ActivationPage> {
   /// 失败不进按钮（用户口径）——失败原因走提示行，按钮保持可重试。
   String? _activateResult;
 
-  /// 卡片一的校验消息行：启动/重新校验/检查网络后如实显示校验进展
-  ///（正在校验 / 连接失败与上次成功时间 / 通过后为空）。
-  String _verifyMsg = '';
-
   /// 「检查网络」的结果（富文本单行：彩色符号 + 结论 + 灰字详情）。
   /// 纯文本装不下「符号带色」这件事，所以网络检查走这一个结构而非
-  /// _verifyMsg——渲染时两者互斥，谁有内容显示谁。
+  /// 状态行——渲染时两者互斥，谁有内容显示谁。
   ({String symbol, Color color, bool ok, String text, String detail})? _verifySpan;
 
   /// 状态显示区当前归属哪个按钮的输出：
@@ -269,7 +265,6 @@ class _ActivationPageState extends State<ActivationPage> {
     setState(() {
       _busy = true;
       _busyAction = 'net';
-      _verifyMsg = '';
       _verifySpan = null;
       _actionLine = 'net';
     });
@@ -346,12 +341,11 @@ class _ActivationPageState extends State<ActivationPage> {
     // 授权校验结束：一按一条消息，且只占状态行一行（一行信息的原则）。
     //   断网 → 状态行就是那句「连接失败」；档位被保留（吊销/封禁等在
     //     断网时原样保留，见 _handleUnreachable）也一样——重新校验这一按
-    //     问得出来的就是「连不上」，原结论等网络恢复的复核自己回来，
-    //     不靠叠第二行强调。
+    //     问得出来的就是「连不上」，原结论等网络恢复的复核自己回来。
     //   问出结论 → 状态行按档位说话。
-    // 消息行（_verifyMsg）只放「上次成功校验」这类事实尾巴，没有就留空
-    // ——它是补充信息，不是第二条消息，绝不复述状态行刚说过的话
-    //（2026-10-09 截图实测：两行只差一个句号的「连接失败」）。
+    // 「上次成功校验」时间不再以第二行出现（2026-10-10 反馈）：状态区在
+    // 结构上只有一行——_verifyMsg 字段已删，任何补充信息都翻不出第二条
+    // 线；时间仍在授权日志里，要排查去日志看。
     setState(() {
       _busy = false;
       _busyAction = null;
@@ -359,20 +353,9 @@ class _ActivationPageState extends State<ActivationPage> {
       if (!r.ok && r.stage != LicenseStage.unreachable) {
         _authHeadline = _netFailLine;
         _authTone = 'red';
-        _verifyMsg = '';
       } else {
         _authHeadline = _headline(_svc.stage);
         _authTone = _toneOf(_svc.stage);
-        if (!r.ok) {
-          final tail = r.message
-              .replaceFirst('授权服务器连接失败，请检查网络', '')
-              .trim();
-          _verifyMsg = tail.isEmpty
-              ? ''
-              : tail.replaceFirst('（', '').replaceFirst('）', '');
-        } else {
-          _verifyMsg = '';
-        }
       }
     });
   }
@@ -591,14 +574,6 @@ class _ActivationPageState extends State<ActivationPage> {
                                 : EchTheme.bodyStyle(_authTone == 'red'
                                     ? EchTheme.red
                                     : EchTheme.textMuted(t))),
-                        // 授权校验的细节（上次成功时间）：只在授权线内显示。
-                        if (_actionLine == 'auth' && _verifyMsg.isNotEmpty) ...[
-                          const SizedBox(height: 8),
-                          Text(_verifyMsg,
-                              maxLines: 3,
-                              overflow: TextOverflow.ellipsis,
-                              style: EchTheme.smallStyle(EchTheme.textSoft(t))),
-                        ],
                       ],
                       const SizedBox(height: 16),
                       // 状态按钮行：常驻。两个按钮常规都是非高亮的描边样式，
