@@ -83,8 +83,21 @@ class TrayManagerPlugin : public flutter::Plugin {
   flutter::PluginRegistrarWindows* registrar;
   NOTIFYICONDATA nid;
   NOTIFYICONIDENTIFIER niif;
-  HMENU hMenu;
+  HMENU hMenu = nullptr;
   bool tray_icon_setted = false;
+
+  // Popup tracking state + deferred-swap staging. SetContextMenu arriving
+  // while a popup is tracking (TrackPopupMenu's nested message pump delivers
+  // platform-channel calls) must NOT swap the live label maps: the open menu
+  // resolves owner-draw labels by item id, and ids missing from the new map
+  // draw as blank rows ("fonts missing", 2026-10-10). Such rebuilds are
+  // staged here and applied atomically when the popup closes.
+  bool popup_active_ = false;
+  HMENU pending_hmenu_ = nullptr;
+  std::unordered_map<UINT_PTR, std::wstring> pending_labels_;
+  std::unordered_set<UINT_PTR> pending_separators_;
+  std::unordered_set<UINT_PTR> pending_submenu_items_;
+  std::unordered_map<UINT_PTR, UINT_PTR> pending_popup_ids_;
 
   // The ID of the WindowProc delegate registration.
   int window_proc_id = -1;
@@ -1784,11 +1797,31 @@ void TrayManagerPlugin::SetContextMenu(
   std::unordered_set<UINT_PTR> new_separators;
   std::unordered_set<UINT_PTR> new_submenu_items;
   std::unordered_map<UINT_PTR, UINT_PTR> new_popup_ids;
-  hMenu = CreatePopupMenu();
-  _CreateMenu(hMenu, std::get<flutter::EncodableMap>(
+  HMENU new_menu = CreatePopupMenu();
+  _CreateMenu(new_menu, std::get<flutter::EncodableMap>(
                          args.at(flutter::EncodableValue("menu"))),
               false, new_labels, new_separators, new_submenu_items,
               new_popup_ids);
+
+  if (popup_active_) {
+    // A popup is tracking (its nested pump delivered this rebuild): stage the
+    // new menu and apply it when the popup closes. Swapping the live maps now
+    // would leave the open menu drawing blank rows for ids missing from the
+    // new maps — the "fonts missing" defect.
+    if (pending_hmenu_ != nullptr) DestroyMenu(pending_hmenu_);
+    pending_hmenu_ = new_menu;
+    pending_labels_.swap(new_labels);
+    pending_separators_.swap(new_separators);
+    pending_submenu_items_.swap(new_submenu_items);
+    pending_popup_ids_.swap(new_popup_ids);
+    result->Success(flutter::EncodableValue(true));
+    return;
+  }
+
+  // No popup open: safe to swap in place. Destroy the replaced HMENU —
+  // it used to leak one menu object per rebuild.
+  if (hMenu != nullptr) DestroyMenu(hMenu);
+  hMenu = new_menu;
   item_labels_.swap(new_labels);
   separator_ids_.swap(new_separators);
   submenu_item_ids_.swap(new_submenu_items);
@@ -1803,9 +1836,8 @@ void TrayManagerPlugin::ShowContextMenuNow() {
   // popups concurrently would clobber the shared hook/overlay/global state and
   // crash the app. If a popup is already tracking, just drop the duplicate
   // (the current menu is already visible and modal).
-  static bool g_popup_active = false;
-  if (g_popup_active) return;
-  g_popup_active = true;
+  if (popup_active_) return;
+  popup_active_ = true;
 
   HWND hWnd = GetMainWindow();
 
@@ -1949,7 +1981,19 @@ void TrayManagerPlugin::ShowContextMenuNow() {
   UnhookWindowsHookEx(g_menu_cbt_hook);
   g_menu_cbt_hook = nullptr;
   g_anchor_valid = false;
-  g_popup_active = false;
+  popup_active_ = false;
+  // Apply any context-menu rebuild that arrived while this popup was open
+  // (staged by SetContextMenu). Atomic swap after close: the open menu kept
+  // its own consistent maps the whole time, and the new menu comes up whole.
+  if (pending_hmenu_ != nullptr) {
+    if (hMenu != nullptr) DestroyMenu(hMenu);
+    hMenu = pending_hmenu_;
+    pending_hmenu_ = nullptr;
+    item_labels_.swap(pending_labels_);
+    separator_ids_.swap(pending_separators_);
+    submenu_item_ids_.swap(pending_submenu_items_);
+    popup_ids_.swap(pending_popup_ids_);
+  }
   ::DeleteObject(back);
 }
 
