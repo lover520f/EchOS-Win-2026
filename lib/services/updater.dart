@@ -185,40 +185,56 @@ class Updater {
     final target = File('${dir.path}$sep$base');
     final tmp = File('${target.path}.part');
     try {
-      // 1-3：先系统代理，失败降级直连
-      HttpClientResponse? resp;
-      for (final viaProxy in [true, false]) {
-        final c = _client(viaProxy: viaProxy);
+      // 切换代理会让在途下载中途断流（2026-10-09 实测）——整段重试一次：
+      // 重新走「系统代理→直连」的建立链，临时文件从头重写（更新包无断点
+      // 续传，重下是唯一安全的恢复；用户取消不受影响）。
+      for (var attempt = 1; attempt <= 2; attempt++) {
+        HttpClientResponse? resp;
+        for (final viaProxy in [true, false]) {
+          final c = _client(viaProxy: viaProxy);
+          try {
+            final req = await c.getUrl(Uri.parse(url));
+            resp = await req.close().timeout(const Duration(seconds: 30));
+            break;
+          } catch (_) {
+            c.close();
+            resp = null;
+          }
+        }
+        if (resp == null || resp.statusCode != 200) {
+          return DownloadOutcome(false, false, '');
+        }
+        final total = resp.contentLength;
+        final sink = tmp.openWrite();
+        var written = 0;
+        var streamed = false;
         try {
-          final req = await c.getUrl(Uri.parse(url));
-          resp = await req.close().timeout(const Duration(seconds: 30));
-          break;
-        } catch (_) {
-          c.close();
-          resp = null;
-        }
-      }
-      if (resp == null || resp.statusCode != 200) {
-        return DownloadOutcome(false, false, '');
-      }
-      final total = resp.contentLength;
-      final sink = tmp.openWrite();
-      var written = 0;
-      await for (final chunk in resp) {
-        if (isCancelled != null && isCancelled()) {
+          await for (final chunk in resp) {
+            if (isCancelled != null && isCancelled()) {
+              await sink.close();
+              if (tmp.existsSync()) tmp.deleteSync();
+              return DownloadOutcome(false, true, '');
+            }
+            sink.add(chunk);
+            written += chunk.length;
+            if (total > 0) onProgress(written / total);
+          }
           await sink.close();
-          if (tmp.existsSync()) tmp.deleteSync();
-          return DownloadOutcome(false, true, '');
+          streamed = true;
+        } catch (_) {
+          // 中途断流：关掉半截文件，落到下一轮 attempt 重新建立连接
+          try {
+            await sink.close();
+          } catch (_) {}
         }
-        sink.add(chunk);
-        written += chunk.length;
-        if (total > 0) onProgress(written / total);
+        if (streamed) {
+          if (target.existsSync()) target.deleteSync();
+          tmp.renameSync(target.path);
+          onProgress(1);
+          return DownloadOutcome(true, false, target.path);
+        }
       }
-      await sink.close();
-      if (target.existsSync()) target.deleteSync();
-      tmp.renameSync(target.path);
-      onProgress(1);
-      return DownloadOutcome(true, false, target.path);
+      return DownloadOutcome(false, false, '');
     } catch (_) {
       try {
         if (tmp.existsSync()) tmp.deleteSync();
