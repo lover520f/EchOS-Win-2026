@@ -103,8 +103,8 @@ EchOS-Win/
 │   ├── portable-config.txt     # 便携版 7z SFX 配置
 │   ├── ChineseSimplified.isl   # 安装界面汉化
 │   └── logo.ico
-├── docs/releases/v1.1.0.md     # 发版说明（自动作为 Release 正文）
-├── docs/                       # 其它文档（Android 适配评估、托盘卡顿分析）
+├── docs/releases/               # 发版说明（v1.2.0 起，自动作为 Release 正文；
+│                                #   更早的版本与内部文档已归档在本地，不入库）
 ├── screenshot/                 # 界面截图
 └── .github/workflows/build-windows.yml   # 打 v* 标签自动构建并发 Release
 ```

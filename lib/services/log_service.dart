@@ -298,16 +298,6 @@ class LogService {
     } catch (_) {}
   }
 
-  /// 打开日志目录（资源管理器）
-  Future<void> openFolder() async {
-    final path = dir;
-    if (!path.existsSync()) path.createSync(recursive: true);
-    try {
-      await Process.start('explorer', [path.path],
-          mode: ProcessStartMode.detached);
-    } catch (_) {}
-  }
-
   /// 当前视图显示的日志行（每级对应各自文件镜像）
   List<String> displayedLines(LogLevel level) {
     switch (level) {

@@ -83,9 +83,6 @@ class LicenseResult {
   final LicenseStage stage;
   final String message;
   const LicenseResult(this.ok, this.stage, this.message);
-
-  static const failedNetwork =
-      LicenseResult(false, LicenseStage.unreachable, '授权服务器连接失败，请检查网络');
 }
 
 class LicenseService {
@@ -97,12 +94,6 @@ class LicenseService {
   static const String baseUrl = String.fromEnvironment('ECHOS_LICENSE_URL');
 
   static bool get enabled => baseUrl.trim().isNotEmpty;
-
-  /// 运行期间每隔多久复查一次。管理员吊销后，客户端最迟要等一个周期
-  /// 才能感知——周期越长，「后台已经吊销、客户端还在跑」的窗口越大。
-  /// 30 分钟对公网往返来说依然很轻（一天 48 次），把吊销感知从小时级
-  /// 压到半小时级。
-  static const Duration reverifyInterval = Duration(minutes: 30);
 
   Timer? _timer;
   LicenseStage _stage = LicenseStage.unknown;
@@ -134,7 +125,6 @@ class LicenseService {
   bool get bootstrapped => _bootstrapped;
   DateTime? get lastVerifiedAt => _lastVerifiedAt;
   String get deviceCode => DeviceIdentity.current;
-  String get deviceCodeGrouped => DeviceIdentity.grouped;
 
   /// 本地已存的激活码。界面上预填它：用户重装 App（不重装系统）时不用重输。
   String get savedCode => _code;
@@ -183,7 +173,7 @@ class LicenseService {
     }
     // 校验在途：状态行如实显示进行时（启动页读这条）。
     _message = '正在校验授权…';
-    _authLog('=== 启动：开始本次授权校验（设备 $deviceCode，客户端版本 $kAppVersion）===');
+    _authLog('=== 启动：开始本次授权校验（设备 $deviceCode，客户端版本 $kAppVersionTag）===');
     await verify(source: '启动校验');
     _timer?.cancel();
     // 启动后 90 秒补查（事件驱动改造后仅 WS 掉线时才有意义：KV 最终
@@ -442,7 +432,7 @@ class LicenseService {
   /// Future，而不是各发一个请求再赌谁先回来。对外校验入口 = 一次本体
   /// 校验 + 失败后的快速重试调度；本机过滤层/弱网常把个别请求掐成瞬时
   /// 失败——失败后 5 秒自动补一发，连续快速重试有上限（约 1 分钟），
-  /// 之后交回 30 分钟周期与 resume 校验。
+  /// 之后交回常规周期与 resume 校验。
   Future<LicenseResult> verify({bool force = false, String source = ''}) {
     if (!enabled) {
       return Future.value(
@@ -558,10 +548,12 @@ class LicenseService {
     // 一并带上客户端版本：管理页那列版本号原先只在激活时写一次、此后永远
     // 是旧值（实测跑 1.1.0 而页面显示 1.2.10）。服务端仅在版本变化时才写，
     // 稳态零写，不破verify 的零写地基。
+    // 版本带平台后缀（kAppVersionTag，如 1.2.11-Win）：管理页靠它区分
+    // Windows / Mac 客户端；纯三段的 kAppVersion 留给 Updater 做更新判定。
     final res = await _post('/verify', {
       'deviceCode': deviceCode,
       'code': _code,
-      'appVersion': kAppVersion,
+      'appVersion': kAppVersionTag,
     });
     if (res == null) {
       final r = _handleUnreachable();
@@ -618,7 +610,7 @@ class LicenseService {
         if (!_shouldApplyNegative(LicenseStage.codeIssued, res['updatedAt'] as String? ?? '')) {
           return const LicenseResult(true, LicenseStage.codeIssued, '');
         }
-        _set(LicenseStage.codeIssued, '激活码已签发，请继续完成注册激活');
+        _set(LicenseStage.codeIssued, '激活码已签发，请将激活码粘贴到输入框后，点击「激活」完成注册');
         return LicenseResult(true, LicenseStage.codeIssued, _message);
       case 'revoked':
         _revalidateAt = null;
@@ -854,7 +846,7 @@ class LicenseService {
       final res = await _post('/activate', {
         'deviceCode': deviceCode,
         'code': code,
-        'appVersion': kAppVersion,
+        'appVersion': kAppVersionTag,
       });
       if (res == null) {
         final r = _handleUnreachable();
@@ -883,10 +875,22 @@ class LicenseService {
               '一机一码，不能跨设备使用');
           return const LicenseResult(
               false, LicenseStage.unknown, '激活码与本机不匹配，请正确输入本机绑定的激活码。');
-        case 'already_active':
-          _authLog('激活失败：该激活码已被其他设备领取过');
-          return const LicenseResult(false, LicenseStage.unknown, '激活失败，请稍后重试');
+        case 'rate_limited':
+          // 限流是激活这一步里唯一「稍后重试真的会好」的失败（按 IP 计数的
+          // 闸门，见服务端 activateGate）。retryAfter 服务端必带，缺省给短值。
+          final waitSec = ((res['retryAfter'] as num?)?.toInt() ?? 5).clamp(2, 60);
+          _authLog('激活被限流：$waitSec 秒后可再试');
+          return LicenseResult(
+              false, LicenseStage.unknown, '操作过于频繁，请 $waitSec 秒后再试');
+        case 'banned':
+          // /activate 会把封禁直接报给激活页：它是终态，重试永远过不去，
+          // 唯一出路是联系管理员——不能落进 default 的「请稍后重试」。
+          _authLog('激活失败：该激活码对应的账号已被管理员封禁');
+          return const LicenseResult(
+              false, LicenseStage.banned, '该账号已被封禁，如有问题请联系管理员反馈。');
         default:
+          // already_active 是管理端「生成」接口的错码，/activate 永远不会
+          // 返回它——原先照它写的分支是死代码，已删。
           _authLog('激活失败：服务端返回了无法识别的状态「${res['status']}」');
           return const LicenseResult(false, LicenseStage.unknown, '激活失败，请稍后重试');
       }
@@ -995,7 +999,8 @@ class LicenseService {
   ///
   /// 从 active 落到任一「服务器明确说不」的档位时，隧道已被停掉，
   /// 运行期的 5 分钟轮询随之取消——若管理员其实刚刚做了「吊销→恢复」
-  /// （或封禁→解封），客户端靠 30 分钟空闲轮询才能回到 active，
+  /// （或封禁→解封），客户端要等空闲兜底周期（最长约 1 小时）才能
+  /// 回到 active，
   /// 用户看到的就是「恢复了好几分钟才缓过来」。KV 收敛只要 ~60 秒，
   /// 所以切断后头几分钟里用短周期复检兜底：30s / 120s / 300s 各补一发，
   /// 读到 active 立即恢复（幂等，纯读）；三发之后交回常规周期。

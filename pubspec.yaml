@@ -72,8 +72,6 @@ flutter:
   assets:
     - assets/icon.png
     - assets/logo.png
-    - assets/logo_88.png
-    - assets/cloud.png
     - assets/tray-blue.ico
     - assets/tray-ora.ico
 

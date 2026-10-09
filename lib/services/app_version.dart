@@ -1,3 +1,5 @@
+import 'dart:io' show Platform;
+
 /// 应用版本号（用于日志展示与更新判定）。
 ///
 /// ## 来源优先级
@@ -20,3 +22,24 @@ const String kAppVersion = String.fromEnvironment(
   'ECHOS_VERSION',
   defaultValue: '1.2.0',
 );
+
+/// 对外上报用的「版本 + 平台」标识（授权服务 /verify、/activate 的
+/// appVersion 字段用它，服务端与管理页原样透传）。
+///
+/// 为什么不直接改 kAppVersion：Updater 的更新判定比较的是纯三段版本号，
+/// 往里拼平台后缀会让 isNewer 解析出错、自动更新静默失效。平台标识
+/// 只随授权上报走这一份，两不相扰。
+///
+/// 平台取运行时系统（Win/Mac 为当前主要两端），其余按原样回退——
+/// 管理页版本列的小徽章只认识已列出的几个，没列出的按普通文本显示。
+final String kAppVersionTag = () {
+  const labels = <String, String>{
+    'windows': 'Win',
+    'macos': 'Mac',
+    'linux': 'Linux',
+    'android': 'Android',
+    'ios': 'iOS',
+  };
+  final os = labels[Platform.operatingSystem] ?? Platform.operatingSystem;
+  return '$kAppVersion-$os';
+}();

@@ -53,10 +53,11 @@ class _KeepCentered with WindowListener {
 
 /// 窗口可见性 → 空闲轮询的门控，外加「亮出来就校验一次」。
 ///
-/// 托盘驻留的空闲实例不再发 30 分钟轮询（its 状态由推送和任何操作时的
-/// 校验对齐）；用户把窗口亮出来的那一刻是最需要真相的时候——show 事件
-/// 顺手补一发校验，配合 resume 校验双保险。事件万一不来（历史遗留的
-/// 平台差异），uiVisible 默认 true，行为退回「照常轮询」，安全降级。
+/// 托盘驻留的空闲实例不发密集轮询（its 状态由推送、慢速兜底和任何
+/// 操作时的校验对齐）；用户把窗口亮出来的那一刻是最需要真相的时候——
+/// show 事件顺手补一发校验，配合 resume 校验双保险。事件万一不来
+/// （历史遗留的平台差异），uiVisible 默认 true，行为退回「照常轮询」，
+/// 安全降级。
 class _WindowVis with WindowListener {
   @override
   void onWindowEvent(String eventName) {
@@ -321,7 +322,7 @@ class _EchOSAppState extends State<EchOSApp> with WidgetsBindingObserver {
       if (mounted) setState(() {});
     });
     // 代理启停也驱动这条同步：运行中的隧道是吊销真正要切断的东西，
-    // 运行期间 5 分钟一查（空闲时 30 分钟的周期对「还在跑的代理」太钝）。
+    // 运行期间 5 分钟一查（空闲兜底的节奏对「还在跑的代理」太钝）。
     AppState.instance.addListener(_syncActiveVerify);
   }
 
@@ -335,7 +336,7 @@ class _EchOSAppState extends State<EchOSApp> with WidgetsBindingObserver {
     // 实时推送在线 = 秒级 resync 已覆盖，5 分钟轮询暂停（省额度）；
     // 推送掉线 → 轮询自动恢复，节奏回到 5 分钟。
     // unreachable 不算「被拦」：隧道还在跑，轮询要继续——否则一次网络
-    // 抖动过后，恢复全靠 30 分钟空闲周期或用户聚焦窗口。
+    // 抖动过后，恢复全靠慢速兜底或用户聚焦窗口。
     final pushLive = LicenseService.instance.pushLive;
     if (running && !LicenseService.instance.hardBlocked && !pushLive) {
       // 掉线兜底轮询：基础 5 分钟，持续掉线指数降档到 15 分钟封顶。
@@ -410,7 +411,7 @@ class _EchOSAppState extends State<EchOSApp> with WidgetsBindingObserver {
           // 用 hardBlocked 而不是 blocked：unreachable（连不上服务器）不切
           // 激活页——那一刻隧道多半还在正常服务，整页切成激活窗而代理
           // 照跑，用户看到的就是「弹窗了却不断网」。unreachable 留在主界面
-          // 由状态栏红字提示，拦新不杀旧；激活页仍可从状态栏点进去。
+          // 由状态栏红字提示，拦新不杀旧，重试由客户端自动重试链承担。
           : LicenseService.instance.hardBlocked
               ? const ActivationPage()
               : const HomePage(),

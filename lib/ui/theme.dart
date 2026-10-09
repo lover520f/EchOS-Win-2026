@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 class EchTheme {
   // 品牌色（含渐变端点）
   static const Color blue = Color(0xFF0A84FF);
-  static const Color indigo = Color(0xFF5856D6);
   static const Color orange = Color(0xFFFF9F0A);
   static const Color green = Color(0xFF30D158);
   static const Color red = Color(0xFFFF3B30);

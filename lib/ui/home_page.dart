@@ -11,7 +11,6 @@ import '../models/config.dart';
 import '../services/app_state.dart';
 import '../services/license_service.dart';
 import '../services/log_service.dart';
-import 'activation_page.dart';
 import 'dialogs.dart';
 import 'frosted.dart';
 import 'theme.dart';
@@ -1431,41 +1430,35 @@ class _LicenseChipState extends State<_LicenseChip> {
     // 只有真的校验通过才算「有效」。enforcementOff 不算：那一刻服务端
     // 是对谁都放行，把它显示成「授权有效」会让所有人误以为自己有授权。
     final ok = st == LicenseStage.active;
-    final color = ok
+    // 校验已停用与未配置同档灰色：它不是故障，红留给真正被拦的状态
+    //（未登记/吊销/封禁/连不上）。
+    final color = ok ||
+            st == LicenseStage.notConfigured ||
+            st == LicenseStage.enforcementOff
         ? EchTheme.textMuted(t)
-        : (st == LicenseStage.notConfigured
-            ? EchTheme.textMuted(t)
-            : EchTheme.red);
+        : EchTheme.red;
 
-    return InkWell(
-      // 只有被拦（未授权/吊销/连不上）才进激活页：那边没有返回键，
-      // 已授权时点进来就是一扇关不上的门。已激活时点击无动作——
-      // 状态本身已经写在标识里，不需要再开一页。
-      onTap: LicenseService.instance.blocked
-          ? () => Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const ActivationPage()),
-            )
-          : null,
-      borderRadius: BorderRadius.circular(6),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              ok ? Icons.verified_user_outlined : Icons.gpp_maybe_outlined,
-              size: 14,
-              color: color,
-            ),
-            const SizedBox(width: 4),
-            Text(_label(svc, st, ok),
-                style: TextStyle(
-                    fontSize: EchTheme.fsCaption,
-                    fontWeight: EchTheme.fwContent,
-                    letterSpacing: EchTheme.letterSpacing,
-                    color: color)),
-          ],
-        ),
+    // 纯展示：激活页由根节点按 hardBlocked 整页切换，不从这里进。
+    // 此前 unreachable 时的点击入口是死路——push 进来的页面会被它
+    // initState 里的 popUntil(isFirst) 立刻弹回，闪一帧即退。
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            ok ? Icons.verified_user_outlined : Icons.gpp_maybe_outlined,
+            size: 14,
+            color: color,
+          ),
+          const SizedBox(width: 4),
+          Text(_label(svc, st, ok),
+              style: TextStyle(
+                  fontSize: EchTheme.fsCaption,
+                  fontWeight: EchTheme.fwContent,
+                  letterSpacing: EchTheme.letterSpacing,
+                  color: color)),
+        ],
       ),
     );
   }

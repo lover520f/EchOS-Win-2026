@@ -13,7 +13,7 @@
 // 没带的话 LicenseService 走 notConfigured 分支（不拦截），本页只能从主界面
 // 状态栏右侧的「授权」那一小条主动点进来——那意味着发出去的是一份拦不住人的包。
 import 'dart:async';
-import 'dart:io' show Socket;
+import 'dart:io' show Socket, SocketException;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -49,7 +49,7 @@ class _ActivationPageState extends State<ActivationPage> {
   Timer? _copiedTimer;
 
   /// 激活按钮的结果态：null = 正常「激活」；'ok' = 绿色「已激活」。
-  /// 失败不进按钮（用户口径）——失败原因走信息行，按钮保持可重试。
+  /// 失败不进按钮（用户口径）——失败原因走提示行，按钮保持可重试。
   String? _activateResult;
 
   /// 卡片一的校验消息行：启动/重新校验/检查网络后如实显示校验进展
@@ -59,7 +59,7 @@ class _ActivationPageState extends State<ActivationPage> {
   /// 「检查网络」的结果（富文本单行：彩色符号 + 结论 + 灰字详情）。
   /// 纯文本装不下「符号带色」这件事，所以网络检查走这一个结构而非
   /// _verifyMsg——渲染时两者互斥，谁有内容显示谁。
-  ({String symbol, Color color, String text, String detail})? _verifySpan;
+  ({String symbol, Color color, bool ok, String text, String detail})? _verifySpan;
 
   /// 状态显示区当前归属哪个按钮的输出：
   /// null=初始快照（启动校验） / 'auth'=重新校验 / 'net'=检查网络。
@@ -73,6 +73,10 @@ class _ActivationPageState extends State<ActivationPage> {
   /// 看起来像检查网络产出了授权提示（用户原则：每个按钮对应一条
   /// 自己的消息）。初始为空：首帧前由 bootstrap 结果填充。
   String _authHeadline = '';
+
+  /// 状态行结论的分类色快照（'red'/'gray'）。
+  /// 存分类不存 Color：initState 里就要写快照，那时拿不到 Theme。
+  String _authTone = 'gray';
 
   /// 弹窗里「点我去 TG 群」要跳的链接，激活页打开时向服务端取一次。
   /// 取不到就是空串，界面上不显示这个按钮——用户仍可以照下面写的
@@ -91,6 +95,7 @@ class _ActivationPageState extends State<ActivationPage> {
   void initState() {
     super.initState();
     _authHeadline = _headline(_svc.stage);
+    _authTone = _toneOf(_svc.stage);
     _code = _svc.savedCode;
     _loadInviteLink();
     // 激活页是**接管性**页面：它出现的那一刻（被吊销/封禁），主界面上一切
@@ -159,6 +164,9 @@ class _ActivationPageState extends State<ActivationPage> {
       _code = text;
       _pasteSeq++;
       _err = false;
+      // 粘贴换了码，上一次的激活结果随之作废（与手动输入同一条规矩），
+      // 不然按钮和输入框还停在「已激活/激活失败」的旧结果色上。
+      _activateResult = null;
       _tip = '已粘贴，点「激活」提交';
     });
   }
@@ -168,19 +176,6 @@ class _ActivationPageState extends State<ActivationPage> {
     _sub?.cancel();
     _copiedTimer?.cancel();
     super.dispose();
-  }
-
-  /// 激活按钮的两种形态：正常「激活」（蓝）、成功「已激活」（绿）。
-  /// 失败不改按钮（用户口径）：失败原因在信息行报告，按钮保持
-  /// 「激活」让用户随时可以重试。
-  String get _activateLabel {
-    return _activateResult == 'ok' ? '已激活' : '激活';
-  }
-
-  Gradient _activateGradient() {
-    return _activateResult == 'ok'
-        ? EchTheme.greenGradient()
-        : EchTheme.blueGradient();
   }
 
   Future<void> _activate() async {
@@ -199,15 +194,10 @@ class _ActivationPageState extends State<ActivationPage> {
       // 那句重复的话由副标题（状态行）承担。
       _tip = r.stage == LicenseStage.unreachable ? '' : r.message;
       _err = !r.ok;
-      // 只有成功才改变按钮形态（绿色「已激活」）。失败时按钮保持
-      // 正常「激活」（用户口径）：失败原因由信息行报告——若把按钮
-      // 变成红色「激活失败」，提示行里"点「激活」"指的那个按钮就
-      // 不在页面上了，用户想重试反而找不到入口。
-      if (r.ok && r.stage == LicenseStage.active) {
-        _activateResult = 'ok';
-      } else {
-        _activateResult = null;
-      }
+      // 失败不改按钮：失败原因在提示行报告（红色），按钮保持「激活」
+      // 让用户随时可重试——按钮一旦变成别的名字，提示行里"点「激活」"
+      // 指的那颗按钮就不在页面上了。
+      _activateResult = r.ok ? 'ok' : null;
     });
     // 激活成功 → 服务已切到 active，主界面靠 changes 事件换页。
     // 事件万一没送达，600ms 后重发一次：对已切换的实例是无害的
@@ -246,29 +236,47 @@ class _ActivationPageState extends State<ActivationPage> {
     }
     final sw = Stopwatch()..start();
     bool ok;
+    Object? netErr;
     try {
       final sock = await Socket.connect(host, 443,
           timeout: const Duration(seconds: 6));
       sock.destroy();
       ok = true;
-    } catch (_) {
+    } catch (e) {
       ok = false;
+      netErr = e;
     }
     sw.stop();
     if (!mounted) return;
     setState(() {
       _busy = false;
       final detail =
-          ok ? '网络延迟 ${sw.elapsedMilliseconds} ms' : '网络异常，请检查本机网络';
+          ok ? '网络延迟 ${sw.elapsedMilliseconds} ms' : _netFailHint(netErr);
+      _netLastOk = ok;
       _verifySpan = (
         symbol: ok ? '✅' : '❌',
         // 与主题 green/red 同源（0xFF30D158 / 0xFFFF3B30）：
         // 符号颜色即结论，一眼分通断。
         color: ok ? const Color(0xFF30D158) : const Color(0xFFFF3B30),
+        ok: ok,
         text: ok ? '授权服务器连接成功' : '授权服务器连接失败',
         detail: detail,
       );
     });
+  }
+
+  /// TCP 探测失败的原因分类。dart:io 的 SocketException 文案是固定英文
+  ///（Windows / macOS 同一套），关键词匹配 + 兜底原句——认不出的措辞
+  /// 退回「网络异常」，不引入新的失败路径。
+  String _netFailHint(Object? e) {
+    if (e is SocketException) {
+      final m = '${e.message} ${e.osError?.message ?? ''}'.toLowerCase();
+      if (m.contains('timed out') || m.contains('timeout')) return '连接超时';
+      if (m.contains('refused')) return '连接被拒绝';
+      if (m.contains('lookup')) return '域名解析失败';
+      if (m.contains('no route') || m.contains('unreachable')) return '网络不可达';
+    }
+    return '网络异常，请检查本机网络';
   }
 
   Future<void> _reverify() async {
@@ -289,6 +297,7 @@ class _ActivationPageState extends State<ActivationPage> {
     // 授权校验结束：状态行刷新为本轮结论——「重新校验」这个按钮的
     // 消息归它（用户原则：每个按钮对应一条消息）。
     _authHeadline = _headline(_svc.stage);
+    _authTone = _toneOf(_svc.stage);
     setState(() {
       _busy = false;
       _err = !r.ok;
@@ -321,6 +330,7 @@ class _ActivationPageState extends State<ActivationPage> {
   Widget build(BuildContext context) {
     final t = Theme.of(context);
     final stage = _svc.stage;
+    final errored = _err || _stageBad(stage);
 
     return Scaffold(
       body: Container(
@@ -340,7 +350,7 @@ class _ActivationPageState extends State<ActivationPage> {
                 // 上下留白比左右多一档：副标题上方和底部按钮下方都要有呼吸空间，
                 // 内容在卡片里读起来是「居中偏松」，不是顶着边框排。
                 padding: const EdgeInsets.fromLTRB(18, 20, 18, 14),
-                tint: _err ? EchTheme.red : EchTheme.blue,
+                tint: errored ? EchTheme.red : EchTheme.blue,
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisSize: MainAxisSize.min,
@@ -348,11 +358,11 @@ class _ActivationPageState extends State<ActivationPage> {
                     Row(
                       children: [
                         Icon(
-                          _err
+                          errored
                               ? Icons.error_outline
                               : Icons.verified_user_outlined,
                           size: 20,
-                          color: _err ? EchTheme.red : EchTheme.blue,
+                          color: errored ? EchTheme.red : EchTheme.blue,
                         ),
                         const SizedBox(width: 8),
                         Text('客户端授权',
@@ -391,7 +401,11 @@ class _ActivationPageState extends State<ActivationPage> {
                               maxLines: 3,
                               overflow: TextOverflow.ellipsis,
                               style: EchTheme.smallStyle(
-                                  _err ? EchTheme.red : EchTheme.textSoft(t))),
+                                  _activateResult == 'ok'
+                                      ? EchTheme.blue
+                                      : (_err
+                                          ? EchTheme.red
+                                          : EchTheme.textSoft(t)))),
                         ],
                         const SizedBox(height: 12),
                         Row(
@@ -410,12 +424,19 @@ class _ActivationPageState extends State<ActivationPage> {
                               const SizedBox(width: 10),
                             ],
                             Expanded(
-                              child: AppButton(_activateLabel,
-                                  gradient: _activateGradient(),
+                              // 两态：蓝「激活」/ 绿「已激活」。失败不改按钮
+                              // （原因走提示行），按钮永远叫「激活」可重试。
+                              child: AppButton(
+                                  _activateResult == 'ok' ? '已激活' : '激活',
+                                  gradient: _activateResult == 'ok'
+                                      ? EchTheme.greenGradient()
+                                      : EchTheme.blueGradient(),
                                   height: 40,
                                   fontSize: EchTheme.fsAction,
                                   fontWeight: EchTheme.fwTitle,
-                                  enabled: !_busy && _code.trim().isNotEmpty,
+                                  // 空码也放行点击：点了好在提示行里报
+                                  //「请输入激活码」，比灰按钮少一次困惑。
+                                  enabled: !_busy,
                                   onPressed: _activate),
                             ),
                           ],
@@ -436,7 +457,11 @@ class _ActivationPageState extends State<ActivationPage> {
                               maxLines: 3,
                               overflow: TextOverflow.ellipsis,
                               style: EchTheme.smallStyle(
-                                  _err ? EchTheme.red : EchTheme.textSoft(t))),
+                                  _activateResult == 'ok'
+                                      ? EchTheme.blue
+                                      : (_err
+                                          ? EchTheme.red
+                                          : EchTheme.textSoft(t)))),
                         ],
                       ],
                     ]),
@@ -465,12 +490,16 @@ class _ActivationPageState extends State<ActivationPage> {
                           crossAxisAlignment: CrossAxisAlignment.center,
                           children: [
                             Text(_verifySpan?.symbol ?? '',
-                                style: const TextStyle(fontSize: 13)),
+                                style: TextStyle(
+                                    fontSize: 13,
+                                    color: _verifySpan?.color)),
                             if ((_verifySpan?.symbol ?? '').isNotEmpty) ...[
                               const SizedBox(width: 6),
                               Text(_verifySpan!.text,
                                   style: EchTheme.smallStyle(
-                                      EchTheme.textSoft(t))),
+                                      _verifySpan!.ok
+                                          ? EchTheme.blue
+                                          : EchTheme.red)),
                               const SizedBox(width: 16),
                               Flexible(
                                 child: Text(_verifySpan!.detail,
@@ -488,7 +517,9 @@ class _ActivationPageState extends State<ActivationPage> {
                             _busy ? _busyLabel : (_authHeadline.isEmpty ? ' ' : _authHeadline),
                             style: _busy
                                 ? EchTheme.bodyStyle(EchTheme.textSoft(t))
-                                : EchTheme.bodyStyle(EchTheme.textMuted(t))),
+                                : EchTheme.bodyStyle(_authTone == 'red'
+                                    ? EchTheme.red
+                                    : EchTheme.textMuted(t))),
                         // 授权校验的细节（上次成功时间）：只在授权线内显示。
                         if (_actionLine == 'auth' && _verifyMsg.isNotEmpty) ...[
                           const SizedBox(height: 8),
@@ -507,7 +538,11 @@ class _ActivationPageState extends State<ActivationPage> {
                       Row(
                         children: [
                           Expanded(
-                            child: stage == LicenseStage.unreachable
+                            // 红色胶囊的两个条件（见 _netLastOk 的注释）：
+                            // 还没查过且授权不可达，或最近一次检查失败。
+                            child: (_netLastOk == null &&
+                                        stage == LicenseStage.unreachable) ||
+                                    _netLastOk == false
                                 ? AppButton('检查网络',
                                     gradient: EchTheme.redGradient(),
                                     height: 40,
@@ -615,13 +650,10 @@ class _ActivationPageState extends State<ActivationPage> {
         _code,
         key: ValueKey(_pasteSeq),
         hint: 'ECHS-XXXX-XXXX-XXXX-XXXX',
-        // 提示（示例）恒为灰；填入的码默认跟主题文字色，
-        // 激活成功变蓝、失败变红——和激活按钮同一套结果指示。
-        textColor: _activateResult == 'ok'
-            ? EchTheme.blue
-            : _activateResult == 'fail'
-                ? EchTheme.red
-                : null,
+        // 提示（示例）恒为灰；填入的码默认跟主题文字色，激活成功变蓝——
+        // 和激活按钮同一套结果指示：成功才变色，失败不碰输入框
+        //（原因在提示行说），按钮保持「激活」可重试。
+        textColor: _activateResult == 'ok' ? EchTheme.blue : null,
         onChanged: (v) {
           _code = v;
           // 改了码，上一次的激活结果就作废：按钮回到「激活」。
@@ -747,12 +779,40 @@ class _ActivationPageState extends State<ActivationPage> {
     );
   }
 
+  /// 「检查网络」最近一次的结果：null = 还没查过。红色胶囊的条件：
+  /// 没查过且当前授权不可达，或最近一次检查失败。
+  bool? _netLastOk;
+
+  /// 状态行文案 + 分类色的口径：服务端明确说不（未登记/吊销/封禁/
+  /// 连不上）与待用户操作（码已签发）都算需要被看见的结论，红字；
+  /// 其余（校验停用、未配置、进行中等）灰。
+  String _toneOf(LicenseStage s) {
+    switch (s) {
+      case LicenseStage.unregistered:
+      case LicenseStage.codeIssued:
+      case LicenseStage.revoked:
+      case LicenseStage.banned:
+      case LicenseStage.unreachable:
+        return 'red';
+      default:
+        return 'gray';
+    }
+  }
+
+  /// 盾牌/边框的"错误"判定比状态行窄一档：码已签发是流程中段不是故障，
+  /// 头部保持蓝色；只有真正的拦下状态才红。
+  bool _stageBad(LicenseStage s) =>
+      s == LicenseStage.unregistered ||
+      s == LicenseStage.revoked ||
+      s == LicenseStage.banned ||
+      s == LicenseStage.unreachable;
+
   String _headline(LicenseStage s) {
     switch (s) {
       case LicenseStage.unregistered:
         return '客户端暂「未授权」，请访问TG群获取激活码。';
       case LicenseStage.codeIssued:
-        return '激活码「已签发」，请在下方完成注册激活。';
+        return '激活码「已签发」，请将激活码粘贴到输入框后，点击「激活」完成注册。';
       case LicenseStage.revoked:
         return '客户端授权「已吊销」，如有问题请联系管理员反馈。';
       case LicenseStage.banned:

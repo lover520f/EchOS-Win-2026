@@ -658,10 +658,6 @@ class AppConfig {
 
 /// 日志区默认高度（px）＝ 4 行 × 行高 15 + 内边距 16
 const double _defaultLogHeight = 4 * 15 + 16;
-/// 日志单行高度（px）
-const double logLineHeight = 15;
-/// 日志区最小行数（拖拽不能低于此）
-const int minLogLines = 4;
 
 String _newUuid() =>
     '${DateTime.now().microsecondsSinceEpoch.toRadixString(16)}-${DateTime.now().millisecond}';

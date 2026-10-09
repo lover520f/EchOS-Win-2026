@@ -378,24 +378,6 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  void duplicateSelected() {
-    final cur = selected;
-    if (cur == null) return;
-    final copy = ServerConfig.fromJson(cur.toJson())..id = _newUuid();
-    var base = '${cur.name} 副本';
-    var n = base;
-    var i = 2;
-    while (config.servers.any((s) => s.name == n)) {
-      n = '$base ${i++}';
-    }
-    copy.name = n;
-    config.servers.add(copy);
-    config.selectedID = copy.id;
-    _saved[copy.id] = ServerConfig.fromJson(copy.toJson());
-    persist();
-    notifyListeners();
-  }
-
   // ---- 启动/停止 ----
 
   Future<void> start() async {
@@ -927,12 +909,6 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> refreshProxySummary() async {
-    systemProxySummary = await SystemProxy.summary();
-    _refreshStatusText();
-    notifyListeners();
-  }
-
   void _refreshProxySummary() {
     SystemProxy.summary().then((v) {
       systemProxySummary = v;
@@ -995,18 +971,6 @@ class AppState extends ChangeNotifier {
   }
 
   List<CustomRule> get customRules => config.customRules;
-
-  Future<void> applyRules() async {
-    if (!isRunning) {
-      rulesDirty = false;
-      notifyListeners();
-      return;
-    }
-    _log('应用新的分流规则，正在重启代理（会短暂断开）…');
-    await _restartKernel();
-    rulesDirty = false;
-    notifyListeners();
-  }
 
   // ---- 自检（连通性/代理接管检查）----
 
@@ -1547,7 +1511,4 @@ del "%~f0"
     LogService.instance.clear();
     refresh(); // 界面立即清空（LogService 只清数据，需重建 UI）
   }
-
-  static String _newUuid() =>
-      '${DateTime.now().microsecondsSinceEpoch.toRadixString(16)}-${DateTime.now().millisecond}';
 }

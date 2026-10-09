@@ -12,11 +12,6 @@ class PortOccupant {
 }
 
 class PortTools {
-  static int lastBindErrno = 0;
-
-  static String get lastBindReason =>
-      lastBindErrno == 0 ? '未知' : 'errno $lastBindErrno';
-
   /// 尝试 bind 127.0.0.1:port，成功=空闲
   static Future<bool> isFree(int port) async {
     try {
@@ -25,17 +20,13 @@ class PortTools {
       // 同步等绑定完成
       return await s.then((sock) {
         sock.close();
-        lastBindErrno = 0;
         return true;
       }).timeout(const Duration(milliseconds: 1500), onTimeout: () {
-        lastBindErrno = -1;
         return false;
       }).catchError((e) {
-        lastBindErrno = -2;
         return false;
       });
     } catch (e) {
-      lastBindErrno = -3;
       return false;
     }
   }
