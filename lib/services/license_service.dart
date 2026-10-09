@@ -851,8 +851,7 @@ class LicenseService {
         // 结果的 stage 带原档位（revoked/…）而不是 unreachable：激活页据此
         // 把「授权服务器连接失败」写进激活提示行（红色），而不是让状态行
         // 一句「已吊销」把断网原因吞掉。
-        return LicenseResult(
-            false, _stage, '授权服务器连接失败，请检查网络');
+        return LicenseResult(false, _stage, netFailHeadline);
       default:
         break;
     }
@@ -864,13 +863,25 @@ class LicenseService {
     // 带上「上次成功校验」的时间，用户报障时能少问一句话；也提醒他
     // 现在用的是本机缓存的状态，服务端那边发生了什么他看不到。
     final tail = last == null ? '' : '（上次成功校验：${_ago(last)}）';
-    _set(LicenseStage.unreachable, '授权服务器连接失败，请检查网络$tail');
+    _set(LicenseStage.unreachable, '$netFailHeadline$tail');
     return LicenseResult(false, LicenseStage.unreachable, _message);
   }
 
   /// 最近一次授权请求是否因网络失败（与 stage 解耦：硬拦档位被保留时
   /// stage 不再是 unreachable，快速重试链靠这个标记继续走）。
   bool _netDown = false;
+
+  /// 最近一次网络失败的分类原因（describeNetError；成功往返后清空）。
+  String? _netErrorHint;
+
+  /// 重新校验失败时状态行的那句话：带具体原因，一行说完——一行信息
+  /// 原则下没有第二行放细节，原因就并进这一行。
+  String get netFailHeadline {
+    final h = _netErrorHint;
+    return h == null || h.isEmpty
+        ? '授权服务器连接失败，请检查网络'
+        : '授权服务器连接失败：$h，请检查网络';
+  }
 
   /// 本次 _verifyOnce 是否经历了「断网 → 恢复」的跳变（见 _verifyWithRetry
   /// 尾部的补发事件）。
@@ -890,6 +901,55 @@ class LicenseService {
   /// 链接放在服务端而不是编译进包里，是为了让管理员改链接不必重新发版。
   /// 取不到时回空串，界面上就不显示那个按钮——这一项只影响跳转，
   /// 为它失败没有意义（服务端这里也刻意返回 200 加空链接，见 License.js）。
+  /// 「检查网络」的探测：与授权请求完全同一条降级链（直连 → 系统代理）、
+  /// 同一深度（完整 TLS 握手并验证证书链）、同一套失败分类。此前是裸
+  /// TCP 握手——TCP 可被任何中间设备代答，2026-10-10 实测 TCP「成功」
+  /// 与 /verify 被假证书挡下同时发生，两个信号自相矛盾。探测不发任何
+  /// API 请求，只对根路径发一个 HEAD（拿到任何 HTTP 状态都算链路通）。
+  Future<({bool ok, int elapsedMs, String? failReason})> probeNetwork() async {
+    if (!enabled) {
+      return (ok: false, elapsedMs: 0, failReason: '未配置授权服务器');
+    }
+    final host = Uri.tryParse(baseUrl)?.host ?? '';
+    if (host.isEmpty) {
+      return (ok: false, elapsedMs: 0, failReason: '未配置授权服务器');
+    }
+    final sw = Stopwatch()..start();
+    Object? err;
+    var ok = await _probeHost(host, viaProxy: false, onErr: (e) => err = e);
+    if (!ok && _systemProxyOn()) {
+      ok = await _probeHost(host, viaProxy: true, onErr: (e) => err = e);
+    }
+    sw.stop();
+    return (
+      ok: ok,
+      elapsedMs: sw.elapsedMilliseconds,
+      failReason:
+          ok ? null : (describeNetError(err) ?? '网络异常，请检查本机网络'),
+    );
+  }
+
+  Future<bool> _probeHost(String host,
+      {required bool viaProxy, required void Function(Object) onErr}) async {
+    final c = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+    if (viaProxy) {
+      final p = _systemProxyAddr();
+      c.findProxy = (uri) => p == null ? 'DIRECT' : 'PROXY $p';
+    } else {
+      c.findProxy = (_) => 'DIRECT';
+    }
+    try {
+      final req = await c.openUrl('HEAD', Uri.parse('https://$host/'));
+      final res = await req.close().timeout(const Duration(seconds: 8));
+      return res.statusCode > 0; // 拿到任何 HTTP 状态 = 链路通
+    } catch (e) {
+      onErr(e);
+      return false;
+    } finally {
+      c.close(force: true);
+    }
+  }
+
   Future<String> fetchInviteLink() async {
     if (!enabled) return '';
     final c = HttpClient()
@@ -1032,13 +1092,78 @@ class LicenseService {
   // HTTP
   // -------------------------------------------------------------------------
 
-  /// 直连，不走系统代理：客户端此刻多半还没起隧道，
-  /// 而且授权校验走代理等于让「能不能用」取决于「能不能上网」，
-  /// 会把两种故障混成一个现象。
+  /// 授权请求出口：**直连优先**（授权可用性不依赖代理，这是刻意的设计），
+  /// 直连失败时用系统代理兜底一发——两发都失败才算 unreachable。
+  ///
+  /// 为什么需要兜底：2026-10-10 实测，直连 443 被稳定劫持（TLS 层持续
+  /// 返回假证书）的环境里，同机浏览器经系统代理一切正常——死守直连等于
+  /// 把这类环境的全体用户拦在门外。Updater 的降级链早已是同一思路
+  /// （先系统代理后直连），这里只是顺序相反：授权以直连为主路径，
+  /// 代理只是直连被掐断时的逃生门，不改变「不依赖代理」的默认语义。
   Future<Map<String, dynamic>?> _post(String path, Map<String, dynamic> body) async {
+    final direct = await _postOnce(path, body, viaProxy: false);
+    if (direct != null) return direct;
+    if (!_systemProxyOn()) return null;
+    final viaSys = await _postOnce(path, body, viaProxy: true);
+    if (viaSys != null) {
+      _authLog('$path 直连失败，经系统代理重试成功（后续校验维持此路径）');
+    }
+    return viaSys;
+  }
+
+  /// 系统代理注册表键（与 SystemProxy 同一处，这里只读不写）。
+  static const String _proxyRegKey =
+      r'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings';
+
+  /// 系统代理是否处于启用状态（ProxyEnable=1 且 ProxyServer 有值）。
+  /// 没开就没有兜底可试，跳过第二发。
+  static bool _systemProxyOn() {
+    try {
+      final r = Process.runSync(
+          'reg', ['query', _proxyRegKey, '/v', 'ProxyEnable'], runInShell: true);
+      if (!(r.stdout as String).contains('0x1')) return false;
+      final s = Process.runSync(
+          'reg', ['query', _proxyRegKey, '/v', 'ProxyServer'], runInShell: true);
+      final line = (s.stdout as String)
+          .split('\n')
+          .where((l) => l.contains('REG_SZ'))
+          .firstOrNull;
+      return line != null && line.split('REG_SZ').last.trim().isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 系统代理地址（host:port）。只取 https 段或最后一段，解析不出返回 null。
+  static String? _systemProxyAddr() {
+    try {
+      final s = Process.runSync(
+          'reg', ['query', _proxyRegKey, '/v', 'ProxyServer'], runInShell: true);
+      final line = (s.stdout as String)
+          .split('\n')
+          .where((l) => l.contains('REG_SZ'))
+          .firstOrNull;
+      var v = line?.split('REG_SZ').last.trim() ?? '';
+      if (v.contains(';')) {
+        v = v.split(';').last;
+        if (v.contains('=')) v = v.split('=').last;
+      }
+      return v.isEmpty ? null : v;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<Map<String, dynamic>?> _postOnce(String path, Map<String, dynamic> body,
+      {required bool viaProxy}) async {
     final c = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 8)
-      ..findProxy = (_) => 'DIRECT';
+      ..connectionTimeout = const Duration(seconds: 8);
+    if (viaProxy) {
+      final p = _systemProxyAddr();
+      c.findProxy = (uri) => p == null ? 'DIRECT' : 'PROXY $p';
+    } else {
+      c.findProxy = (_) => 'DIRECT';
+    }
     try {
       final req = await c.postUrl(Uri.parse('$baseUrl$path'));
       req.headers.contentType = ContentType.json;
@@ -1052,6 +1177,7 @@ class LicenseService {
       // 只有解析不出 JSON 的响应（代理劫持页、网关错误页）才当「连不上」。
       final decoded = jsonDecode(text);
       _lastStatusCode = res.statusCode;
+      _netErrorHint = null;
       if (res.statusCode >= 400 && res.statusCode < 500 && decoded is Map<String, dynamic>) {
         return decoded;
       }
@@ -1067,6 +1193,7 @@ class LicenseService {
       // CERTIFICATE_VERIFY_FAILED: self signed certificate(boringssl 路径…)
       // 这类多行英文源码位置整段砸进授权日志，既难读也没有分类。
       final cls = describeNetError(e);
+      _netErrorHint = cls;
       if (cls != null) {
         _authLog('$path 请求失败：$cls');
       } else {
@@ -1101,7 +1228,7 @@ class LicenseService {
       final m = '${e.message} ${e.osError ?? ''}'.toLowerCase();
       if (m.contains('certificate_verify_failed') || m.contains('self signed') ||
           m.contains('certificate')) {
-        return 'TLS 证书校验失败（常见于断网时的劫持应答或本机过滤软件）';
+        return 'TLS 证书校验失败';
       }
       return 'TLS 握手失败';
     }

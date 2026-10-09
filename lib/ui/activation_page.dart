@@ -13,8 +13,6 @@
 // 没带的话 LicenseService 走 notConfigured 分支（不拦截），本页只能从主界面
 // 状态栏右侧的「授权」那一小条主动点进来——那意味着发出去的是一份拦不住人的包。
 import 'dart:async';
-import 'dart:io' show Socket;
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -88,10 +86,9 @@ class _ActivationPageState extends State<ActivationPage> {
   /// 存分类不存 Color：initState 里就要写快照，那时拿不到 Theme。
   String _authTone = 'gray';
 
-  /// 断网时状态行的那句话（_headline(unreachable) 同文）。去重判断的
-  /// 基准：同一时刻整页只允许它出现一次——状态行挂着它时，激活提示行
-  /// 的断网失败就留空（那句重复的话由状态行承担）。
-  static const String _netFailLine = '授权服务器连接失败，请检查网络。';
+  /// 状态行是否正挂着「连接失败」那句（netFailHeadline 以它开头，
+  /// 原因后缀可能不同）。
+  bool _isNetFailHeadline(String s) => s.startsWith('授权服务器连接失败');
 
   /// 弹窗里「点我去 TG 群」要跳的链接。本地缓存先顶上（进页面即可见，
   /// 不再等一趟网络），再向服务端取最新的覆盖。断网取不到时按钮照常
@@ -135,7 +132,7 @@ class _ActivationPageState extends State<ActivationPage> {
       // 状态行还挂着「连接失败」而网络其实已恢复（快速重试链拿到了新
       // 结论，但硬拦档位没变、不会有 stage 事件）——事件到来时把快照
       // 对齐回真实档位，不让断网时的那句话一直盖着「已吊销」。
-      if (_authHeadline == _netFailLine && !_svc.netDown) {
+      if (_isNetFailHeadline(_authHeadline) && !_svc.netDown) {
         _authHeadline = _headline(_svc.stage);
         _authTone = _toneOf(_svc.stage);
       }
@@ -224,7 +221,7 @@ class _ActivationPageState extends State<ActivationPage> {
       // （刚按过重新校验）提示行就不再复述同一句；状态行还在说旧结论时
       // 由提示行自己报一次。失败原因归提示行（红色），按钮保持可重试。
       _tip = r.stage == LicenseStage.unreachable ||
-              (r.ok == false && _authHeadline == _netFailLine)
+              (r.ok == false && _isNetFailHeadline(_authHeadline))
           ? ''
           : r.message;
       _actErr = !r.ok;
@@ -268,33 +265,23 @@ class _ActivationPageState extends State<ActivationPage> {
       _verifySpan = null;
       _actionLine = 'net';
     });
-    final host = Uri.tryParse(LicenseService.baseUrl)?.host ?? '';
-    if (host.isEmpty) {
-      // 本地开发包（没注入授权地址）：真实用户永远到不了这一档，
-      // 界面不留提示——暴露内部配置状态没有服务对象，排查靠 auth.log。
-      if (!mounted) return;
-      setState(() => _busy = false);
+    final r = await _svc.probeNetwork();
+    if (!mounted) return;
+    // 本地开发包（没注入授权地址）：真实用户永远到不了这一档，
+    // 界面不留提示——暴露内部配置状态没有服务对象，排查靠 auth.log。
+    if (!LicenseService.enabled) {
+      setState(() {
+        _busy = false;
+        _busyAction = null;
+      });
       return;
     }
-    final sw = Stopwatch()..start();
-    bool ok;
-    Object? netErr;
-    try {
-      final sock = await Socket.connect(host, 443,
-          timeout: const Duration(seconds: 6));
-      sock.destroy();
-      ok = true;
-    } catch (e) {
-      ok = false;
-      netErr = e;
-    }
-    sw.stop();
-    if (!mounted) return;
     setState(() {
       _busy = false;
       _busyAction = null;
+      final ok = r.ok;
       final detail =
-          ok ? '网络延迟 ${sw.elapsedMilliseconds} ms' : _netFailHint(netErr);
+          ok ? '网络延迟 ${r.elapsedMs} ms' : (r.failReason ?? '网络异常');
       _netLastOk = ok;
       _verifySpan = (
         symbol: ok ? '✅' : '❌',
@@ -306,14 +293,6 @@ class _ActivationPageState extends State<ActivationPage> {
         detail: detail,
       );
     });
-  }
-
-  /// TCP 探测失败的原因分类：口径与授权请求日志共用一份
-  /// （LicenseService.describeNetError），认不出的措辞退回
-  /// 「网络异常」，不引入新的失败路径。
-  String _netFailHint(Object? e) {
-    final s = LicenseService.describeNetError(e);
-    return s ?? '网络异常，请检查本机网络';
   }
 
   Future<void> _reverify() async {
@@ -351,7 +330,7 @@ class _ActivationPageState extends State<ActivationPage> {
       _busyAction = null;
       _authErr = !r.ok;
       if (!r.ok && r.stage != LicenseStage.unreachable) {
-        _authHeadline = _netFailLine;
+        _authHeadline = _svc.netFailHeadline;
         _authTone = 'red';
       } else {
         _authHeadline = _headline(_svc.stage);
@@ -873,7 +852,8 @@ class _ActivationPageState extends State<ActivationPage> {
       case LicenseStage.banned:
         return '客户端授权「已被封禁」，如有问题请联系管理员反馈。';
       case LicenseStage.unreachable:
-        return _netFailLine;
+        // 带具体原因（service 侧对最近一次失败的分类），一行说完。
+        return _svc.netFailHeadline;
       case LicenseStage.unknown:
         // 冷启动/校验在途：进行时由状态行的进行时文案单点报告
         //「正在校验授权…」。副标题不再重复同样的话——两行一样的字
