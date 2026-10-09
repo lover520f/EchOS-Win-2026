@@ -974,9 +974,11 @@ class LicenseService {
     }
     final sw = Stopwatch()..start();
     Object? err;
-    var ok = await _probeHost(host, viaProxy: false, onErr: (e) => err = e);
+    // 与 /verify 同一条链、同一个偏好（_preferProxy）：校验走哪条路能通，
+    // 探测就走哪条路，两个信号永远一致。
+    var ok = await _probeHost(host, viaProxy: _preferProxy, onErr: (e) => err = e);
     if (!ok && await _systemProxyOn()) {
-      ok = await _probeHost(host, viaProxy: true, onErr: (e) => err = e);
+      ok = await _probeHost(host, viaProxy: !_preferProxy, onErr: (e) => err = e);
     }
     sw.stop();
     return (
@@ -1173,21 +1175,41 @@ class LicenseService {
   /// 授权请求出口：**直连优先**（授权可用性不依赖代理，这是刻意的设计），
   /// 直连失败时用系统代理兜底一发——两发都失败才算 unreachable。
   ///
-  /// 为什么需要兜底：2026-10-10 实测，直连 443 被稳定劫持（TLS 层持续
-  /// 返回假证书）的环境里，同机浏览器经系统代理一切正常——死守直连等于
-  /// 把这类环境的全体用户拦在门外。Updater 的降级链早已是同一思路
-  /// （先系统代理后直连），这里只是顺序相反：授权以直连为主路径，
-  /// 代理只是直连被掐断时的逃生门，不改变「不依赖代理」的默认语义。
+  /// 代理兜底成功过一次后 [_preferProxy] 置位：后续请求**代理优先**、直连
+  /// 降为兜底。直连被持续劫持的环境（2026-10-10 实测：直连 443 被掏假证书，
+  /// 系统代理正常）里，每次先撞一遍直连既白付一次 TLS 失败、也在日志里
+  /// 刷一串「证书校验失败」——记住走哪条路能通，错误串从源头消失。每 30
+  /// 分钟放一枪直连重探（[_preferProxyAt]），直连恢复即复位，不把人永久
+  /// 锁在代理路径上。
   Future<Map<String, dynamic>?> _post(String path, Map<String, dynamic> body) async {
-    final direct = await _postOnce(path, body, viaProxy: false);
-    if (direct != null) return direct;
-    if (!await _systemProxyOn()) return null;
-    final viaSys = await _postOnce(path, body, viaProxy: true);
-    if (viaSys != null) {
-      _authLog('$path 直连失败，经系统代理重试成功');
+    final proxyOn = await _systemProxyOn();
+    if (_preferProxy &&
+        _preferProxyAt != null &&
+        DateTime.now().difference(_preferProxyAt!) > const Duration(minutes: 30)) {
+      _preferProxy = false; // 放一枪直连重探：恢复了就回直连优先
     }
-    return viaSys;
+    final proxyFirst = _preferProxy && proxyOn;
+    final a = await _postOnce(path, body, viaProxy: proxyFirst);
+    if (a != null) return a;
+    if (!proxyOn) return null;
+    final b = await _postOnce(path, body, viaProxy: !proxyFirst);
+    if (b != null) {
+      if (proxyFirst) {
+        _preferProxy = false;
+        _authLog('$path 系统代理失败，直连成功——恢复直连优先');
+      } else {
+        _preferProxy = true;
+        _preferProxyAt = DateTime.now();
+        _authLog('$path 直连失败，经系统代理成功——此后代理优先（每 30 分钟重探直连）');
+      }
+      return b;
+    }
+    return null;
   }
+
+  /// 代理优先标记与其置位时刻（见 _post 的说明）。
+  bool _preferProxy = false;
+  DateTime? _preferProxyAt;
 
   // 系统代理查询结果缓存：直连被掐的环境里每次失败校验都会走到这里，
   // reg.exe 查询不能在 UI isolate 上反复同步跑（spawn cmd+reg 常态

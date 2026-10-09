@@ -351,14 +351,6 @@ std::optional<LRESULT> TrayManagerPlugin::HandleWindowProc(HWND hWnd,
             "onTrayIconMouseDown",
             std::make_unique<flutter::EncodableValue>());
         break;
-      case WM_RBUTTONDOWN:
-        // Dispatch the press event (menu pops on UP, giving Dart a window
-        // to heal the context menu before it is shown: SetContextMenu
-        // while a menu is open wipes the owner-draw label table).
-        channel->InvokeMethod(
-            "onTrayIconRightMouseDown",
-            std::make_unique<flutter::EncodableValue>());
-        break;
       case WM_RBUTTONUP:
         // Pop the menu straight from the native tray message. Routing this
         // through Dart (invokeMethod -> TrayListener -> popUpContextMenu) added
