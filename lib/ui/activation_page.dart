@@ -875,8 +875,8 @@ class _ActivationPageState extends State<ActivationPage> {
       case LicenseStage.unreachable:
         return _netFailLine;
       case LicenseStage.unknown:
-        // 冷启动/校验在途：进行时由按钮上方的消息行（_verifyMsg）单点
-        // 报告「正在校验授权…」。副标题不再重复同样的话——两行一样的字
+        // 冷启动/校验在途：进行时由状态行的进行时文案单点报告
+        //「正在校验授权…」。副标题不再重复同样的话——两行一样的字
         // 看起来像凭空新增了一条，也违反「消息只占一行」的原则。
         return '';
       default:
